@@ -1,37 +1,31 @@
-# XboxInput GIP — Xbox 360 DashLaunch plugin
+# XboxInput  — Xbox 360 DashLaunch plugin
 
 Use wired official Xbox One and Xbox Series controllers as standard Xbox 360
 gamepads on a modded Xbox 360 running retail dashboard 2.0.17559.0.
 
-The included `XboxInputGip-17559-retail.xex` is retail-converted and ready for
-DashLaunch. It supports ABXY, D-pad, Menu/Start, View/Back, bumpers, stick
-clicks, triggers, both analogue sticks, player assignment, controller sleep /
-reconnect, Guide tap, and rumble.
 
-Supported wired Microsoft GIP controller IDs are `045E:02D1`, `02DD`, `02E3`,
-`02EA`, `0B00`, and `0B12`. This includes Xbox One, One S, Elite, Elite Series
+Controllers compatible with this includes Xbox One, One S, Elite, Elite Series
 2, and Series X|S wired controllers.
 
-## Install
+Full Xbox 360 Controller functionality with rumble.
+Controllers with more buttons than the original do not have any mappings nor can they be mapped.
+Long press on the guide button is not supported with the current setup.
 
-1. Disable any old XboxInput plugin in DashLaunch and reboot.
-2. Copy `XboxInputGip-17559-retail.xex` to `HDD:\XboxInputGip.xex`.
-3. Add `pluginN = HDD:\XboxInputGip.xex` to the `[Plugins]` section of the
+## Install
+The plugin isn't recognised from within dashlaunch so needs to be installed manually via the launch.ini
+
+1. Copy `XboxInput.xex` to the hard drive or any usb location.
+2. Add `pluginN = HDD:\XboxInputGip.xex` to the `[Plugins]` section of the
    DashLaunch `launch.ini`; see `launch.ini.example`.
-4. Reboot with the controller disconnected. Once the dashboard is running,
+3. Reboot with the controller disconnected. Once the dashboard is running,
    connect it by USB.
 
-Do not overwrite the active plugin through FTP. Disable it, reboot, copy the
-replacement, then enable it and reboot again.
+The controller hook isn't very consistent. If the controller does not connect unplug and replug the cable.
 
-The controller’s Guide button supports a normal tap. The native held-Guide
-power menu is not available through the retail 17559 virtual-controller API.
-Headset/audio and Share have no matching Xbox 360 controller feature.
+## Building
+See `BUILDING.md`.
 
 ## Source and licensing
-
-`source/` is a self-contained native C++ Xbox 360 project. It requires the
-official Xbox 360 XDK and Visual Studio 2010 Xbox 360 toolset. See
-`BUILDING.md`.
+This project requires the official Xbox 360 XDK and Visual Studio 2010 Xbox 360 toolset. 
 
 This release is GPL-3.0. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
