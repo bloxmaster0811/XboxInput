@@ -11,6 +11,8 @@ Full Xbox 360 Controller functionality with rumble.
 Controllers with more buttons than the original do not have any mappings nor can they be mapped.
 Long press on the guide button is not supported with the current setup.
 
+Tested working with Xbox One S controller and Xbox Series Controller
+
 ## Install
 The plugin isn't recognised from within dashlaunch so needs to be installed manually via the launch.ini
 
@@ -20,7 +22,7 @@ The plugin isn't recognised from within dashlaunch so needs to be installed manu
 3. Reboot with the controller disconnected. Once the dashboard is running,
    connect it by USB.
 
-The controller hook isn't very consistent. If the controller does not connect unplug and replug the cable.
+The controller hook isn't very consistent. If the controller does not connect straight away unplug and replug the cable.
 
 ## Building
 See `BUILDING.md`.
