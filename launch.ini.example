@@ -1,4 +1,2 @@
-; Copy XboxInputGip-17559-retail.xex to HDD:\XboxInputGip.xex and merge this
-; section into the launch.ini DashLaunch loads during boot.
 [Plugins]
-plugin1 = HDD:\XboxInputGip.xex
+plugin1 = HDD:\XboxInput.xex
