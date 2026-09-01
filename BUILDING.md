@@ -17,5 +17,8 @@ XexTool.exe -r a -m r "Release Retail\riffmaster.xex"
 
 Deploy the resulting XEX using the install instructions in `README.md`.
 
-The project intentionally skips USB-stack reset at plugin load. Boot to the
-dashboard first, then connect the controller.
+Alternatively you can use the script included.
+
+```text
+.\build-release.ps1 -MsBuildPath 'C:\Path\To\MSBuild.exe' -XexToolPath 'C:\Tools\XexTool.exe'
+```
