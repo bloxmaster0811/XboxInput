@@ -14,7 +14,7 @@ Long press on the guide button is not supported with the current setup.
 Tested working with Xbox One S controller and Xbox Series Controller
 
 ## Install
-The plugin isn't recognised from within dashlaunch so needs to be installed manually via the launch.ini
+Copy to the Hard drive or any other location to be added from within dashlaunch or installed manually via the launch.ini
 
 1. Copy `XboxInput.xex` to the hard drive or any usb location.
 2. Add `pluginN = HDD:\XboxInputGip.xex` to the `[Plugins]` section of the
