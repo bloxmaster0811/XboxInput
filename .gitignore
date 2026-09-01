@@ -1,0 +1,10 @@
+Release Retail/
+Debug/
+*.obj
+*.pdb
+*.xdb
+*.tlog
+*.lastbuildstate
+*.log
+.vs/
+ipch/
