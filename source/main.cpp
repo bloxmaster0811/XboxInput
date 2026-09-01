@@ -1642,6 +1642,11 @@ static int     g_gipOutBufIdx = 0;
 static bool    g_gipOutOpen = false;
 static uint8_t g_gipSeq = 1;
 static bool    g_gipIdentifySent = false;
+// A controller repeats ANNOUNCE until it receives IDENTIFY.  The original
+// one-shot gate meant one dropped outbound transfer left that session stuck
+// until the cable was physically replugged.
+static bool    g_gipIdentifyReplySeen = false;
+static DWORD   g_gipLastIdentifyTick = 0;
 static bool    g_gipPoweredOn = false;
 // The normal wired gamepad does not use the RiffMaster dongle's RSA path.
 static bool    g_gipAuthStarted = true;
@@ -2441,25 +2446,35 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 		g_gipPacketsSeen++;
 
 		switch (hdr.command) {
-		case GIP_CMD_ANNOUNCE:
+		case GIP_CMD_ANNOUNCE: {
 			// Payload offsets 8-11 are VID/PID little-endian - verified in the capture.
-			if (!g_gipIdentifySent) {
+			// The controller will keep announcing until it sees IDENTIFY.  Re-send it
+			// at a modest rate until the first IDENTIFY reply proves the packet arrived.
+			// This recovers a transient first-transfer loss without re-claiming or
+			// resetting the USB device (both are unsafe while a prior TRB may be live).
+			DWORD now = GetTickCount();
+			bool retryIdentify = g_gipIdentifySent && !g_gipIdentifyReplySeen &&
+				((DWORD)(now - g_gipLastIdentifyTick) >= 1000);
+			if (!g_gipIdentifySent || retryIdentify) {
 				if (hdr.packetLength >= 12)
 					RM_DBG("RIFFMASTER: GIP ANNOUNCE seq=%d VID=%04X PID=%04X\r\n",
 						hdr.sequence,
 						payload[8] | (payload[9] << 8),
 						payload[10] | (payload[11] << 8));
-				// The device repeats ANNOUNCE until answered. Reply once.
-				RM_DBG("RIFFMASTER: -> sending IDENTIFY\r\n");
+				RM_DBG("RIFFMASTER: -> sending IDENTIFY%s\r\n",
+					retryIdentify ? " (retry)" : "");
 				g_gipIdentifySent = true;
+				g_gipLastIdentifyTick = now;
 				g_gipChunkTotal = 0;
 				GipSend(g_gipExt.deviceHandle, GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, 0, 0);
 			}
 			break;
+		}
 
 		case GIP_CMD_IDENTIFY:
 			// Chunked descriptor reply. ACK when the device asks us to, then power on
 			// once the terminating zero-length chunk arrives.
+			g_gipIdentifyReplySeen = true;
 			RM_DBG("RIFFMASTER: GIP IDENTIFY chunk opts=%02X len=%u off=%u\r\n",
 				hdr.options, hdr.packetLength, hdr.chunkOffset);
 
@@ -3274,8 +3289,10 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 
 		// 5. Reset the session so a replug starts clean rather than resuming
 		//    half-initialised state.
-		g_gipIdentifySent = false;
-		g_gipPoweredOn = false;
+			g_gipIdentifySent = false;
+			g_gipIdentifyReplySeen = false;
+			g_gipLastIdentifyTick = 0;
+			g_gipPoweredOn = false;
 		g_gipAuthStarted = true;
 		g_gipReady = false;
 		g_gipGuideDown = false;
