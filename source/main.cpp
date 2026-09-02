@@ -1674,9 +1674,12 @@ static bool     g_gipHostFinishReady = false;
 // completion callbacks can run at an IRQL where allocation is not safe.  They are
 // not connected to the live single-controller path yet; the following refactor
 // moves GIP/XAM state into the owning slot one subsystem at a time.
-// The existing proven path owns player 1.  Three additional slots therefore preserve
-// the Xbox 360's real four-controller limit rather than claiming a fifth USB device.
-#define GIP_MAX_SESSIONS 3
+// The existing proven path owns player 1.  At most three additional sessions may be
+// active, preserving the Xbox 360's four-controller limit.  Keep extra retired
+// storage so disconnect/reconnect never reuses a USB transfer structure that could
+// still be referenced by a late completion.
+#define GIP_MAX_SESSIONS 8
+#define GIP_MAX_ADDITIONAL_ACTIVE 3
 struct GipSessionSlot {
 	bool                    reserved;
 	HidControllerExtension  ext;
@@ -1719,6 +1722,14 @@ static GipSessionSlot* GipFindFreeSession() {
 			return &g_gipSessions[i];
 	}
 	return 0;
+}
+
+static int GipActiveSessionCount() {
+	int count = 0;
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i)
+		if (g_gipSessions[i].reserved && g_gipSessions[i].ext.deviceHandle)
+			++count;
+	return count;
 }
 
 static GipSessionSlot* GipSessionFromUser(uint8_t user) {
@@ -3274,7 +3285,8 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 		IsSupportedMicrosoftGamepadPid(swap_endianness_16(dd->idProduct)) &&
 		id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
 		id->bInterfaceProtocol == 0xD0 && id->bInterfaceNumber == 0 &&
-		id->bNumEndpoints == 2 && GipFindFreeSession()) {
+		id->bNumEndpoints == 2 &&
+		GipActiveSessionCount() < GIP_MAX_ADDITIONAL_ACTIVE && GipFindFreeSession()) {
 		return GipClaimAdditionalSession(h, id->bInterfaceNumber);
 	}
 
