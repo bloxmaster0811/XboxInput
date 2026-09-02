@@ -11,7 +11,7 @@ Full Xbox 360 Controller functionality with rumble.
 Controllers with more buttons than the original do not have any mappings nor can they be mapped.
 Long press on the guide button is not supported with the current setup.
 
-Multiple controllers connected this way are unsupported as of now but should work along side official controllers (untested)
+Multiple controllers should now be supported! Please report any problems to the issues page!
 
 Tested working with Xbox One S controller and Xbox Series Controller
 
