@@ -1662,6 +1662,80 @@ static GipTranscript g_gipTranscript;
 static BYTE     g_gipHostFinish[50];
 static bool     g_gipHostFinishReady = false;
 
+// ---- multi-controller ownership foundation ---------------------------------
+//
+// USB completion callbacks recover HidControllerExtension from the address of a
+// field inside it (interruptTrb is at +4 and controlTrb at +36).  A multi-pad
+// implementation must therefore give every claimed device a permanently distinct
+// extension, transfer requests and buffers; sharing the old globals across two
+// devices can re-queue a TRB still owned by the USB stack.
+//
+// These slots are deliberately fixed rather than heap allocated: claim and
+// completion callbacks can run at an IRQL where allocation is not safe.  They are
+// not connected to the live single-controller path yet; the following refactor
+// moves GIP/XAM state into the owning slot one subsystem at a time.
+#define GIP_MAX_SESSIONS 4
+struct GipSessionSlot {
+	bool                    reserved;
+	HidControllerExtension  ext;
+	UsbTrb                  outTrb;
+	BYTE                    readBuf[GIP_READ_BUF_SIZE];
+	BYTE                    outBuf[GIP_TX_BUFS][64];
+	int                     outBufIndex;
+	bool                    outOpen;
+	uint8_t                 sequence;
+	bool                    identifySent;
+	bool                    identifyReplySeen;
+	DWORD                   lastIdentifyTick;
+	bool                    poweredOn;
+	bool                    ready;
+	GipGamepadState         state;
+	bool                    guideDown;
+	bool                    guidePending;
+	DWORD                   lastGuideTick;
+	uint8_t                 userIndex;
+	uint32_t                deviceContext;
+	DWORD                   packetNumber;
+	int                     packetsSeen;
+	int                     inputsSeen;
+	int                     readErrors;
+	bool                    readLoopStopped;
+};
+static GipSessionSlot g_gipSessions[GIP_MAX_SESSIONS];
+
+static GipSessionSlot* GipSessionFromExtension(HidControllerExtension* ext) {
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (&g_gipSessions[i].ext == ext)
+			return &g_gipSessions[i];
+	}
+	return 0;
+}
+
+static GipSessionSlot* GipFindFreeSession() {
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (!g_gipSessions[i].reserved)
+			return &g_gipSessions[i];
+	}
+	return 0;
+}
+
+static GipSessionSlot* GipSessionFromUser(uint8_t user) {
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (g_gipSessions[i].reserved && g_gipSessions[i].ready &&
+			g_gipSessions[i].userIndex == user)
+			return &g_gipSessions[i];
+	}
+	return 0;
+}
+
+static GipSessionSlot* GipSessionFromContext(uint32_t context) {
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (g_gipSessions[i].reserved && g_gipSessions[i].ready &&
+			g_gipSessions[i].deviceContext == context)
+			return &g_gipSessions[i];
+	}
+	return 0;
+
 // Sequence is adapter-global and never zero - refs/xone/bus/protocol.c:335-337.
 static uint8_t GipNextSeq() {
 	uint8_t s = g_gipSeq++;
@@ -1712,6 +1786,44 @@ static int GipSendGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor
 		0xFF, 0x00, 0x00
 	};
 	return GipSend(h, GIP_CMD_RUMBLE, 0x00, payload, sizeof(payload));
+}
+
+// Session-local outbound path used by the multi-controller implementation.  It
+// intentionally has no shared sequence counter, transfer request or buffer.
+static uint8_t GipSessionNextSeq(GipSessionSlot* session) {
+	uint8_t seq = session->sequence++;
+	if (session->sequence == 0)
+		session->sequence = 1;
+	return seq;
+}
+
+static int GipSessionSend(GipSessionSlot* session, uint8_t cmd, uint8_t options,
+	const BYTE* payload, int payloadLen) {
+	if (!session || !session->outOpen || !session->ext.deviceHandle ||
+		payloadLen < 0 || payloadLen > 60)
+		return -1;
+	BYTE* buf = session->outBuf[session->outBufIndex];
+	session->outBufIndex = (session->outBufIndex + 1) % GIP_TX_BUFS;
+	int i = 0;
+	buf[i++] = cmd;
+	buf[i++] = options;
+	buf[i++] = GipSessionNextSeq(session);
+	buf[i++] = (BYTE)payloadLen;
+	if (payload && payloadLen) {
+		memcpy(buf + i, payload, payloadLen);
+		i += payloadLen;
+	}
+	SendInterruptRequest(session->ext.deviceHandle, &session->outTrb, buf, i,
+		(DWORD)noopCompleteHandler);
+	return 0;
+}
+
+static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
+	const BYTE payload[9] = {
+		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
+		0xFF, 0x00, 0x00
+	};
+	return GipSessionSend(session, GIP_CMD_RUMBLE, 0x00, payload, sizeof(payload));
 }
 
 //
@@ -3510,6 +3622,13 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration)
 
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
+	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
+	if (multiSession) {
+		const BYTE left = vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0;
+		const BYTE right = vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0;
+		GipSessionSendRumble(multiSession, left, right);
+		return ERROR_SUCCESS;
+	}
 
 	// XAM passes the 16-bit 360 motor speeds in XINPUT_VIBRATION. Convert them
 	// to the gamepad's 8-bit direct-motor values.
@@ -3545,6 +3664,14 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 
 	if (!capabilities)
 		return status;
+	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
+	if (multiSession) {
+		GipFillGuitarCaps(capabilities->Type, capabilities->SubType,
+			capabilities->Flags, capabilities->Gamepad);
+		capabilities->Vibration.wLeftMotorSpeed = 0;
+		capabilities->Vibration.wRightMotorSpeed = 0;
+		return ERROR_SUCCESS;
+	}
 
 	// ---- RiffMaster: report a GUITAR, not a gamepad ----------------------
 	// This runs before hiddriver360's own path so real HID pads keep reporting
@@ -3623,6 +3750,13 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 		user = 0;
 	if (!caps)
 		return status;
+	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
+	if (multiSession) {
+		GipFillGuitarCaps(caps->Type, caps->SubType, caps->Flags, caps->Gamepad);
+		caps->Vibration.wLeftMotorSpeed = 0;
+		caps->Vibration.wRightMotorSpeed = 0;
+		return ERROR_SUCCESS;
+	}
 
 	if (g_gipUserIndex != 0xFF && user == g_gipUserIndex && g_gipReady) {
 		if (g_gipCaps2Logged < 3) {
@@ -3639,6 +3773,25 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 }
 
 NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXINPUT_GAMEPAD pInputData, PBOOL unk) {
+	GipSessionSlot* multiSession = GipSessionFromContext(dwDeviceContext);
+	if (multiSession) {
+		if (!pInputData)
+			return ERROR_INVALID_PARAMETER;
+		GipGamepadToXInput(&multiSession->state, pInputData);
+		if (multiSession->guidePending && g_rmCfg.guideButton) {
+			multiSession->guidePending = false;
+			DWORD now = GetTickCount();
+			if (now - multiSession->lastGuideTick >= (DWORD)g_rmCfg.guideCooldownMs) {
+				multiSession->lastGuideTick = now;
+				XamInputSendXenonButtonPress(multiSession->userIndex);
+			}
+		}
+		if (pdwPacketNumber)
+			*pdwPacketNumber = ++multiSession->packetNumber;
+		if (unk)
+			*unk = FALSE;
+		return STATUS_SUCCESS;
+	}
 	// ---- RiffMaster: synthesize a 360 guitar report ----------------------
 	// Checked before hiddriver360's own lookup: our state comes from the GIP parser,
 	// not from its HID ButtonsReport.
