@@ -52,3 +52,16 @@ product IDs:
   retail 17559 virtual-controller API.
 - Headset/audio and Share have no Xbox 360 controller equivalent.
 - Wireless adapters and non-controller Microsoft GIP accessories are excluded.
+# Multi-controller validation
+
+The 17559 multi-controller build was validated on-console with two official wired
+Xbox One/Series controllers:
+
+- each controller received an independent player slot;
+- input, Guide and rumble worked independently;
+- disconnecting either controller left the other usable;
+- the disconnected controller reconnected successfully, including repeated cycles;
+- sleep/wake and USB-port changes worked during the test.
+
+The Xbox 360 limit remains four active controllers. Two controllers have been tested;
+three- and four-controller simultaneous use remains unverified hardware coverage.
