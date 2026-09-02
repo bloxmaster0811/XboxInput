@@ -11,13 +11,17 @@ Full Xbox 360 Controller functionality with rumble.
 Controllers with more buttons than the original do not have any mappings nor can they be mapped.
 Long press on the guide button is not supported with the current setup.
 
+Multiple controllers connected this way are unsupported as of now but should work along side official controllers (untested)
+
 Tested working with Xbox One S controller and Xbox Series Controller
 
 ## Install
 Copy to the Hard drive or any other location to be added from within dashlaunch or installed manually via the launch.ini
 
+Incompatible with Hiddriver 360
+
 1. Copy `XboxInput.xex` to the hard drive or any usb location.
-2. Add `pluginN = HDD:\XboxInputGip.xex` to the `[Plugins]` section of the
+2. Add `pluginN = HDD:\XboxInput.xex` to the `[Plugins]` section of the
    DashLaunch `launch.ini`; see `launch.ini.example`.
 3. Reboot with the controller disconnected. Once the dashboard is running,
    connect it by USB.
@@ -26,8 +30,11 @@ The controller hook isn't very consistent. If the controller does not connect st
 
 ## Building
 See `BUILDING.md`.
-
-## Source and licensing
 This project requires the official Xbox 360 XDK and Visual Studio 2010 Xbox 360 toolset. 
 
+## Credits
+Thanks to EnTim23 who made the Hiddriver360 project and helped provide the backend virtual controller configuration and mapping https://github.com/EinTim23/hiddriver360
+
+Thanks to Durg5 who made the riffmaster-rgh360 project who saved me the headache of figuring out the GIP transport https://github.com/Durg5/riffmaster-rgh360
+## licensing
 This release is GPL-3.0. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
