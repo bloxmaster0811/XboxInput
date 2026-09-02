@@ -1670,11 +1670,13 @@ static bool     g_gipHostFinishReady = false;
 // extension, transfer requests and buffers; sharing the old globals across two
 // devices can re-queue a TRB still owned by the USB stack.
 //
-// These slots are deliberately fixed rather than heap allocated: claim and
+// These additional slots are deliberately fixed rather than heap allocated: claim and
 // completion callbacks can run at an IRQL where allocation is not safe.  They are
 // not connected to the live single-controller path yet; the following refactor
 // moves GIP/XAM state into the owning slot one subsystem at a time.
-#define GIP_MAX_SESSIONS 4
+// The existing proven path owns player 1.  Three additional slots therefore preserve
+// the Xbox 360's real four-controller limit rather than claiming a fifth USB device.
+#define GIP_MAX_SESSIONS 3
 struct GipSessionSlot {
 	bool                    reserved;
 	HidControllerExtension  ext;
