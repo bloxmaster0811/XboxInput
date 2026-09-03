@@ -95,6 +95,14 @@ extern "C" void* _ReturnAddress(void);
 // to a small FTP-readable file as well. RM_LOG is deliberately never used for
 // normal input packets, so this does not put filesystem I/O in the input path.
 static const char* const kXboxInputLogPath = "HDD:\\XboxInputGip.log";
+#ifdef XBOXINPUT_COMPAT_PROBE
+static const char* const kXboxInputCompatProbeLogPath = "HDD:\\XboxInputCompatProbe.log";
+static volatile LONG  g_xboxInputCompatProbeSerial = 0;
+static volatile DWORD g_xboxInputCompatProbeVidPid = 0;
+static volatile DWORD g_xboxInputCompatProbeDevClass = 0;
+static volatile DWORD g_xboxInputCompatProbeInterface = 0;
+static volatile DWORD g_xboxInputCompatProbeProtocol = 0;
+#endif
 static volatile LONG g_xboxInputDiagStage = 0;
 static volatile DWORD g_xboxInputGuideCaller = 0;
 static volatile DWORD g_xboxInputGuideUiState = 0;
@@ -103,6 +111,11 @@ static void XboxInputLogReset() {
 	FILE* file = fopen(kXboxInputLogPath, "w");
 	if (file)
 		fclose(file);
+#ifdef XBOXINPUT_COMPAT_PROBE
+	file = fopen(kXboxInputCompatProbeLogPath, "w");
+	if (file)
+		fclose(file);
+#endif
 }
 
 static void XboxInputSetDiagStage(LONG stage) {
@@ -202,6 +215,9 @@ static DWORD XboxInputLogThread(PVOID) {
 	LONG written = -1;
 	DWORD writtenGuideCaller = 0;
 	DWORD writtenGuideUiState = 0;
+#ifdef XBOXINPUT_COMPAT_PROBE
+	LONG writtenProbeSerial = 0;
+#endif
 	for (;;) {
 		LONG stage = g_xboxInputDiagStage;
 		if (stage != written) {
@@ -225,6 +241,24 @@ static DWORD XboxInputLogThread(PVOID) {
 			writtenGuideCaller = guideCaller;
 			writtenGuideUiState = guideUiState;
 		}
+#ifdef XBOXINPUT_COMPAT_PROBE
+		LONG probeSerial = g_xboxInputCompatProbeSerial;
+		if (probeSerial != writtenProbeSerial) {
+			DWORD vp = g_xboxInputCompatProbeVidPid;
+			DWORD dc = g_xboxInputCompatProbeDevClass;
+			DWORD iface = g_xboxInputCompatProbeInterface;
+			FILE* probe = fopen(kXboxInputCompatProbeLogPath, "a");
+			if (probe) {
+				fprintf(probe, "serial=%ld vid=%04X pid=%04X devclass=%02X/%02X/%02X if=%u endpoints=%u ifclass=%02X/%02X/%02X\\r\\n",
+					probeSerial, (WORD)(vp >> 16), (WORD)vp,
+					(BYTE)(dc >> 16), (BYTE)(dc >> 8), (BYTE)dc,
+					(BYTE)(iface >> 24), (BYTE)(iface >> 16),
+					(BYTE)(iface >> 8), (BYTE)iface, (BYTE)g_xboxInputCompatProbeProtocol);
+				fclose(probe);
+			}
+			writtenProbeSerial = probeSerial;
+		}
+#endif
 		Sleep(250);
 	}
 }
@@ -3276,6 +3310,30 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			 id->bInterfaceProtocol == 0xD0) ? "   <<< GIP" : "");
 	else
 		RM_DBG("RIFFMASTER:   iface descriptor NULL\r\n");
+
+#ifdef XBOXINPUT_COMPAT_PROBE
+	// Observation only: the build must be safe to give to users with unknown
+	// hardware.  It never claims, configures, resets or opens the device.
+	if (dd) {
+		g_xboxInputCompatProbeVidPid =
+			((DWORD)swap_endianness_16(dd->idVendor) << 16) |
+			swap_endianness_16(dd->idProduct);
+		g_xboxInputCompatProbeDevClass = ((DWORD)dd->bDeviceClass << 16) |
+			((DWORD)dd->bDeviceSubClass << 8) | dd->bDeviceProtocol;
+		if (id) {
+			g_xboxInputCompatProbeInterface = ((DWORD)id->bInterfaceNumber << 24) |
+				((DWORD)id->bNumEndpoints << 16) |
+				((DWORD)id->bInterfaceClass << 8) | id->bInterfaceSubClass;
+			g_xboxInputCompatProbeProtocol = id->bInterfaceProtocol;
+		}
+		else {
+			g_xboxInputCompatProbeInterface = 0;
+			g_xboxInputCompatProbeProtocol = 0;
+		}
+		InterlockedIncrement(&g_xboxInputCompatProbeSerial);
+	}
+	return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
+#endif
 
 	// Once the proven primary path already owns one modern gamepad, every later
 	// matching controller gets a distinct fixed session instead of overwriting the
