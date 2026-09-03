@@ -1,15 +1,14 @@
-# XboxInput  — Xbox 360 DashLaunch plugin
+# XboxInput  — Use Xbox One/Series Controllers on your modded Xbox 360!
 
 Use wired official Xbox One and Xbox Series controllers as standard Xbox 360
-gamepads on a modded Xbox 360 running retail dashboard 2.0.17559.0.
-
+gamepads on a modded Xbox 360 .
 
 Controllers compatible with this includes Xbox One, One S, Elite, Elite Series
 2, and Series X|S wired controllers.
 
 Full Xbox 360 Controller functionality with rumble.
 Controllers with more buttons than the original do not have any mappings nor can they be mapped.
-Long press on the guide button is not supported with the current setup.
+Long press on the guide button is not supported.
 
 Have a third-party Xbox One/Series Controller and want it supported? Please read the guide and make an issue using the template!
 [Third-party Support Guide](https://github.com/bloxmaster0811/XboxInput/blob/main/THIRD_PARTY_CONTROLLER_SUPPORT.md)
