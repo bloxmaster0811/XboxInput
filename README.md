@@ -11,6 +11,9 @@ Full Xbox 360 Controller functionality with rumble.
 Controllers with more buttons than the original do not have any mappings nor can they be mapped.
 Long press on the guide button is not supported with the current setup.
 
+Have a third-party Xbox One/Series Controller and want it supported? Please read the guide and make an issue using the template!
+[Third-party Support Guide](https://github.com/bloxmaster0811/XboxInput/blob/main/THIRD_PARTY_CONTROLLER_SUPPORT.md)
+
 Multiple controllers should now be supported! Please report any problems to the issues page!
 
 Tested working with Xbox One S controller and Xbox Series Controller
