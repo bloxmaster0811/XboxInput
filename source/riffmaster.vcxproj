@@ -51,7 +51,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;RIFFMASTER_GIP_ONLY;RIFFMASTER_NO_USB_RESET;RIFFMASTER_KEEP_DRIVER</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;RIFFMASTER_GIP_ONLY;RIFFMASTER_NO_USB_RESET;RIFFMASTER_KEEP_DRIVER;$(XboxInputCompatProbe)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
