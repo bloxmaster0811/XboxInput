@@ -95,13 +95,49 @@ extern "C" void* _ReturnAddress(void);
 // to a small FTP-readable file as well. RM_LOG is deliberately never used for
 // normal input packets, so this does not put filesystem I/O in the input path.
 static const char* const kXboxInputLogPath = "HDD:\\XboxInputGip.log";
+static const char* XboxInputKnownControllerName(uint16_t pid);
+
+// USB callbacks can run above PASSIVE_LEVEL, so they queue compact events here.
+// The existing logger thread is the only code that writes them to HDD.
+#define XBOXINPUT_LOG_EVENT_COUNT 32
+enum XboxInputLogEventType {
+	XBOXINPUT_LOG_CONTROLLER_DETECTED = 1,
+	XBOXINPUT_LOG_CONTROLLER_READY = 2,
+	XBOXINPUT_LOG_CONTROLLER_REMOVED = 3,
+	XBOXINPUT_LOG_USB_FAILURE = 4,
+};
+struct XboxInputLogEvent {
+	volatile LONG serial; // Published last by the producer.
+	DWORD type;
+	DWORD value1;
+	DWORD value2;
+};
+static volatile LONG g_xboxInputLogEventSerial = 0;
+static XboxInputLogEvent g_xboxInputLogEvents[XBOXINPUT_LOG_EVENT_COUNT];
+
+static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
+	LONG serial = InterlockedIncrement(&g_xboxInputLogEventSerial);
+	XboxInputLogEvent* event =
+		&g_xboxInputLogEvents[(serial - 1) % XBOXINPUT_LOG_EVENT_COUNT];
+	event->serial = 0;
+	event->type = type;
+	event->value1 = value1;
+	event->value2 = value2;
+	__sync();
+	event->serial = serial;
+}
 #ifdef XBOXINPUT_COMPAT_PROBE
 static const char* const kXboxInputCompatProbeLogPath = "HDD:\\XboxInputCompatProbe.log";
+#define XBOXINPUT_COMPAT_PROBE_RECORDS 16
+struct XboxInputCompatProbeRecord {
+	volatile LONG serial; // Published last by the USB callback.
+	DWORD vidPid;
+	DWORD devClass;
+	DWORD iface;
+	DWORD protocol;
+};
 static volatile LONG  g_xboxInputCompatProbeSerial = 0;
-static volatile DWORD g_xboxInputCompatProbeVidPid = 0;
-static volatile DWORD g_xboxInputCompatProbeDevClass = 0;
-static volatile DWORD g_xboxInputCompatProbeInterface = 0;
-static volatile DWORD g_xboxInputCompatProbeProtocol = 0;
+static XboxInputCompatProbeRecord g_xboxInputCompatProbeRecords[XBOXINPUT_COMPAT_PROBE_RECORDS];
 #endif
 static volatile LONG g_xboxInputDiagStage = 0;
 static volatile DWORD g_xboxInputGuideCaller = 0;
@@ -215,6 +251,7 @@ static DWORD XboxInputLogThread(PVOID) {
 	LONG written = -1;
 	DWORD writtenGuideCaller = 0;
 	DWORD writtenGuideUiState = 0;
+	LONG writtenEventSerial = 0;
 #ifdef XBOXINPUT_COMPAT_PROBE
 	LONG writtenProbeSerial = 0;
 #endif
@@ -241,22 +278,59 @@ static DWORD XboxInputLogThread(PVOID) {
 			writtenGuideCaller = guideCaller;
 			writtenGuideUiState = guideUiState;
 		}
+		LONG eventSerial = g_xboxInputLogEventSerial;
+		while (writtenEventSerial < eventSerial) {
+			LONG wanted = writtenEventSerial + 1;
+			XboxInputLogEvent* event =
+				&g_xboxInputLogEvents[(wanted - 1) % XBOXINPUT_LOG_EVENT_COUNT];
+			if (event->serial != wanted)
+				break;
+			FILE* file = fopen(kXboxInputLogPath, "a");
+			if (file) {
+				switch (event->type) {
+				case XBOXINPUT_LOG_CONTROLLER_DETECTED:
+					fprintf(file, "event=controller_detected vid=%04X pid=%04X model=%s interface=%u endpoints=%u\r\n",
+						(WORD)(event->value1 >> 16), (WORD)event->value1,
+						XboxInputKnownControllerName((WORD)event->value1),
+						(BYTE)(event->value2 >> 8), (BYTE)event->value2);
+					break;
+				case XBOXINPUT_LOG_CONTROLLER_READY:
+					fprintf(file, "event=controller_ready user=%u context=%08X\r\n",
+						(BYTE)event->value1, event->value2);
+					break;
+				case XBOXINPUT_LOG_CONTROLLER_REMOVED:
+					fprintf(file, "event=controller_removed user=%u\r\n", (BYTE)event->value1);
+					break;
+				case XBOXINPUT_LOG_USB_FAILURE:
+					fprintf(file, "event=usb_failure step=%u status=%08X\r\n",
+						event->value1, event->value2);
+					break;
+				}
+				fclose(file);
+			}
+			writtenEventSerial = wanted;
+		}
 #ifdef XBOXINPUT_COMPAT_PROBE
 		LONG probeSerial = g_xboxInputCompatProbeSerial;
-		if (probeSerial != writtenProbeSerial) {
-			DWORD vp = g_xboxInputCompatProbeVidPid;
-			DWORD dc = g_xboxInputCompatProbeDevClass;
-			DWORD iface = g_xboxInputCompatProbeInterface;
+		while (writtenProbeSerial < probeSerial) {
+			LONG wanted = writtenProbeSerial + 1;
+			XboxInputCompatProbeRecord* record =
+				&g_xboxInputCompatProbeRecords[(wanted - 1) % XBOXINPUT_COMPAT_PROBE_RECORDS];
+			if (record->serial != wanted)
+				break; // A burst exceeded the small ring; retain later records safely.
+			DWORD vp = record->vidPid;
+			DWORD dc = record->devClass;
+			DWORD iface = record->iface;
 			FILE* probe = fopen(kXboxInputCompatProbeLogPath, "a");
 			if (probe) {
-				fprintf(probe, "serial=%ld vid=%04X pid=%04X devclass=%02X/%02X/%02X if=%u endpoints=%u ifclass=%02X/%02X/%02X\\r\\n",
-					probeSerial, (WORD)(vp >> 16), (WORD)vp,
+				fprintf(probe, "serial=%ld vid=%04X pid=%04X devclass=%02X/%02X/%02X if=%u endpoints=%u ifclass=%02X/%02X/%02X\r\n",
+					wanted, (WORD)(vp >> 16), (WORD)vp,
 					(BYTE)(dc >> 16), (BYTE)(dc >> 8), (BYTE)dc,
 					(BYTE)(iface >> 24), (BYTE)(iface >> 16),
-					(BYTE)(iface >> 8), (BYTE)iface, (BYTE)g_xboxInputCompatProbeProtocol);
+					(BYTE)(iface >> 8), (BYTE)iface, (BYTE)record->protocol);
 				fclose(probe);
 			}
-			writtenProbeSerial = probeSerial;
+			writtenProbeSerial = wanted;
 		}
 #endif
 		Sleep(250);
@@ -1611,6 +1685,17 @@ int UsbdGetDeviceSpeedHook(deviceHandle* h) {
 // other Microsoft GIP-class devices include adapters and accessories, which
 // must never be claimed as a gamepad.
 const uint16_t MICROSOFT_VENDOR_ID = 0x045E;
+static const char* XboxInputKnownControllerName(uint16_t pid) {
+	switch (pid) {
+	case 0x02D1: return "Xbox One";
+	case 0x02DD: return "Xbox One (2015)";
+	case 0x02E3: return "Xbox One Elite";
+	case 0x02EA: return "Xbox One S";
+	case 0x0B00: return "Xbox Elite Series 2";
+	case 0x0B12: return "Xbox Series X|S";
+	default: return "Unknown";
+	}
+}
 static bool IsSupportedMicrosoftGamepadPid(uint16_t pid) {
 	switch (pid) {
 	case 0x02D1: // Xbox One
@@ -2336,6 +2421,7 @@ static void GipRegisterWithXam() {
 
 	g_gipUserIndex = userIndex;
 	g_gipDeviceContext = context;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, userIndex, context);
 	RM_LOG("XBOXINPUT: registered virtual GAMEPAD in XAM, user index %d\r\n",
 		userIndex);
 }
@@ -2369,6 +2455,8 @@ static void GipSessionRegisterWithXam(GipSessionSlot* session) {
 		session->userIndex = user;
 		session->deviceContext = context;
 		session->ready = (user != 0xFF);
+		if (session->ready)
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, user, context);
 		return;
 	}
 }
@@ -3103,7 +3191,10 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 
 	RM_LOG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
 	if (status != 0)
+	{
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 50, status);
 		return status;
+	}
 
 	// Prefer the descriptor. It returned NULL on hardware for this device - the lookup
 	// appears to depend on interface state our non-standard claim path never established -
@@ -3156,6 +3247,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
 		epAddr, pkt, interval, (DWORD*)&ext->interruptTrb);
 	if (NT_ERROR(s)) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 60, s);
 		RM_LOG("RIFFMASTER: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
 		return s;
 	}
@@ -3315,22 +3407,27 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	// Observation only: the build must be safe to give to users with unknown
 	// hardware.  It never claims, configures, resets or opens the device.
 	if (dd) {
-		g_xboxInputCompatProbeVidPid =
+		LONG serial = InterlockedIncrement(&g_xboxInputCompatProbeSerial);
+		XboxInputCompatProbeRecord* record =
+			&g_xboxInputCompatProbeRecords[(serial - 1) % XBOXINPUT_COMPAT_PROBE_RECORDS];
+		record->serial = 0;
+		record->vidPid =
 			((DWORD)swap_endianness_16(dd->idVendor) << 16) |
 			swap_endianness_16(dd->idProduct);
-		g_xboxInputCompatProbeDevClass = ((DWORD)dd->bDeviceClass << 16) |
+		record->devClass = ((DWORD)dd->bDeviceClass << 16) |
 			((DWORD)dd->bDeviceSubClass << 8) | dd->bDeviceProtocol;
 		if (id) {
-			g_xboxInputCompatProbeInterface = ((DWORD)id->bInterfaceNumber << 24) |
+			record->iface = ((DWORD)id->bInterfaceNumber << 24) |
 				((DWORD)id->bNumEndpoints << 16) |
 				((DWORD)id->bInterfaceClass << 8) | id->bInterfaceSubClass;
-			g_xboxInputCompatProbeProtocol = id->bInterfaceProtocol;
+			record->protocol = id->bInterfaceProtocol;
 		}
 		else {
-			g_xboxInputCompatProbeInterface = 0;
-			g_xboxInputCompatProbeProtocol = 0;
+			record->iface = 0;
+			record->protocol = 0;
 		}
-		InterlockedIncrement(&g_xboxInputCompatProbeSerial);
+		__sync();
+		record->serial = serial;
 	}
 	return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
 #endif
@@ -3345,6 +3442,10 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 		id->bInterfaceProtocol == 0xD0 && id->bInterfaceNumber == 0 &&
 		id->bNumEndpoints == 2 &&
 		GipActiveSessionCount() < GIP_MAX_ADDITIONAL_ACTIVE && GipFindFreeSession()) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
+			((DWORD)swap_endianness_16(dd->idVendor) << 16) |
+			swap_endianness_16(dd->idProduct),
+			((DWORD)id->bInterfaceNumber << 8) | id->bNumEndpoints);
 		return GipClaimAdditionalSession(h, id->bInterfaceNumber);
 	}
 
@@ -3387,6 +3488,9 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			XboxInputSetDiagStage(20);
 
 			g_gipClaimAttempts++;
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
+				((DWORD)vid << 16) | pid,
+				((DWORD)id->bInterfaceNumber << 8) | id->bNumEndpoints);
 #ifdef RIFFMASTER_CLAIM_ONCE
 			s_claimedOnce = true;
 #endif
@@ -3590,6 +3694,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			}
 		}
 		if (session) {
+			const uint8_t removedUser = session->userIndex;
 			session->ready = false;
 			session->guidePending = false;
 			session->outOpen = false;
@@ -3603,6 +3708,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 				session->userIndex = 0xFF;
 				session->deviceContext = 0;
 			}
+			if (removedUser != 0xFF)
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_REMOVED, removedUser, 0);
 			return 0;
 		}
 	}
@@ -3696,7 +3803,10 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		// 4. Release the XAM virtual controller.
 		//    This was MISSING: the guitar stayed registered after the device was
 		//    gone, so XAM kept a controller bound to a dead device indefinitely.
+		const uint8_t removedUser = g_gipUserIndex;
 		GipUnregisterFromXam();
+		if (removedUser != 0xFF)
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_REMOVED, removedUser, 0);
 
 		// 5. Reset the session so a replug starts clean rather than resuming
 		//    half-initialised state.
