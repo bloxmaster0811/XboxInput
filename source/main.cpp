@@ -94,7 +94,17 @@ extern "C" void* _ReturnAddress(void);
 // Debug Monitor is not present on most retail RGH setups. Mirror milestone logs
 // to a small FTP-readable file as well. RM_LOG is deliberately never used for
 // normal input packets, so this does not put filesystem I/O in the input path.
-static const char* const kXboxInputLogPath = "HDD:\\XboxInputGip.log";
+// Keep diagnostics usable on consoles without an HDD (for example BadAvatar
+// installs that run from internal MU or USB).  The first writable device is
+// remembered so the normal and compatibility logs stay together.
+static const char* const kXboxInputLogPaths[] = {
+	"HDD:\\XboxInputGip.log",
+	"Usb:\\XboxInputGip.log",
+	"Usb0:\\XboxInputGip.log",
+	"Usb1:\\XboxInputGip.log",
+	"IntMu:\\XboxInputGip.log",
+	"MmcMu:\\XboxInputGip.log",
+};
 static const char* XboxInputKnownControllerName(uint16_t pid);
 
 // USB callbacks can run above PASSIVE_LEVEL, so they queue compact events here.
@@ -127,7 +137,14 @@ static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
 	event->serial = serial;
 }
 #ifdef XBOXINPUT_COMPAT_PROBE
-static const char* const kXboxInputCompatProbeLogPath = "HDD:\\XboxInputCompatProbe.log";
+static const char* const kXboxInputCompatProbeLogPaths[] = {
+	"HDD:\\XboxInputCompatProbe.log",
+	"Usb:\\XboxInputCompatProbe.log",
+	"Usb0:\\XboxInputCompatProbe.log",
+	"Usb1:\\XboxInputCompatProbe.log",
+	"IntMu:\\XboxInputCompatProbe.log",
+	"MmcMu:\\XboxInputCompatProbe.log",
+};
 #define XBOXINPUT_COMPAT_PROBE_RECORDS 16
 struct XboxInputCompatProbeRecord {
 	volatile LONG serial; // Published last by the USB callback.
@@ -142,13 +159,50 @@ static XboxInputCompatProbeRecord g_xboxInputCompatProbeRecords[XBOXINPUT_COMPAT
 static volatile LONG g_xboxInputDiagStage = 0;
 static volatile DWORD g_xboxInputGuideCaller = 0;
 static volatile DWORD g_xboxInputGuideUiState = 0;
+static volatile LONG g_xboxInputLogPathIndex = -1;
+
+static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
+	const DWORD pathCount = sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0]);
+	LONG selected = g_xboxInputLogPathIndex;
+	if (selected >= 0 && (DWORD)selected < pathCount) {
+#ifdef XBOXINPUT_COMPAT_PROBE
+		const char* path = compatibilityProbe
+			? kXboxInputCompatProbeLogPaths[selected]
+			: kXboxInputLogPaths[selected];
+#else
+		UNREFERENCED_PARAMETER(compatibilityProbe);
+		const char* path = kXboxInputLogPaths[selected];
+#endif
+		FILE* file = fopen(path, mode);
+		if (file)
+			return file;
+	}
+
+	for (DWORD i = 0; i < pathCount; i++) {
+		if ((LONG)i == selected)
+			continue;
+#ifdef XBOXINPUT_COMPAT_PROBE
+		const char* path = compatibilityProbe
+			? kXboxInputCompatProbeLogPaths[i]
+			: kXboxInputLogPaths[i];
+#else
+		const char* path = kXboxInputLogPaths[i];
+#endif
+		FILE* file = fopen(path, mode);
+		if (file) {
+			InterlockedExchange(&g_xboxInputLogPathIndex, (LONG)i);
+			return file;
+		}
+	}
+	return NULL;
+}
 
 static void XboxInputLogReset() {
-	FILE* file = fopen(kXboxInputLogPath, "w");
+	FILE* file = XboxInputOpenLog(false, "w");
 	if (file)
 		fclose(file);
 #ifdef XBOXINPUT_COMPAT_PROBE
-	file = fopen(kXboxInputCompatProbeLogPath, "w");
+	file = XboxInputOpenLog(true, "w");
 	if (file)
 		fclose(file);
 #endif
@@ -258,7 +312,7 @@ static DWORD XboxInputLogThread(PVOID) {
 	for (;;) {
 		LONG stage = g_xboxInputDiagStage;
 		if (stage != written) {
-			FILE* file = fopen(kXboxInputLogPath, "a");
+			FILE* file = XboxInputOpenLog(false, "a");
 			if (file) {
 				fprintf(file, "stage=%ld\r\n", stage);
 				fclose(file);
@@ -269,7 +323,7 @@ static DWORD XboxInputLogThread(PVOID) {
 		DWORD guideUiState = g_xboxInputGuideUiState;
 		if (guideCaller && (guideCaller != writtenGuideCaller ||
 			guideUiState != writtenGuideUiState)) {
-			FILE* file = fopen(kXboxInputLogPath, "a");
+			FILE* file = XboxInputOpenLog(false, "a");
 			if (file) {
 				fprintf(file, "guideCaller=%08X xenonUi=%u\r\n",
 					guideCaller, guideUiState);
@@ -285,7 +339,7 @@ static DWORD XboxInputLogThread(PVOID) {
 				&g_xboxInputLogEvents[(wanted - 1) % XBOXINPUT_LOG_EVENT_COUNT];
 			if (event->serial != wanted)
 				break;
-			FILE* file = fopen(kXboxInputLogPath, "a");
+			FILE* file = XboxInputOpenLog(false, "a");
 			if (file) {
 				switch (event->type) {
 				case XBOXINPUT_LOG_CONTROLLER_DETECTED:
@@ -321,7 +375,7 @@ static DWORD XboxInputLogThread(PVOID) {
 			DWORD vp = record->vidPid;
 			DWORD dc = record->devClass;
 			DWORD iface = record->iface;
-			FILE* probe = fopen(kXboxInputCompatProbeLogPath, "a");
+			FILE* probe = XboxInputOpenLog(true, "a");
 			if (probe) {
 				fprintf(probe, "serial=%ld vid=%04X pid=%04X devclass=%02X/%02X/%02X if=%u endpoints=%u ifclass=%02X/%02X/%02X\r\n",
 					wanted, (WORD)(vp >> 16), (WORD)vp,
