@@ -102,6 +102,10 @@ static const char* const kXboxInputLogPaths[] = {
 	"Usb:\\XboxInputGip.log",
 	"Usb0:\\XboxInputGip.log",
 	"Usb1:\\XboxInputGip.log",
+	"Mu:\\XboxInputGip.log",
+	"Mu0:\\XboxInputGip.log",
+	"UsbMu:\\XboxInputGip.log",
+	"FlashMu:\\XboxInputGip.log",
 	"IntMu:\\XboxInputGip.log",
 	"MmcMu:\\XboxInputGip.log",
 };
@@ -142,6 +146,10 @@ static const char* const kXboxInputCompatProbeLogPaths[] = {
 	"Usb:\\XboxInputCompatProbe.log",
 	"Usb0:\\XboxInputCompatProbe.log",
 	"Usb1:\\XboxInputCompatProbe.log",
+	"Mu:\\XboxInputCompatProbe.log",
+	"Mu0:\\XboxInputCompatProbe.log",
+	"UsbMu:\\XboxInputCompatProbe.log",
+	"FlashMu:\\XboxInputCompatProbe.log",
 	"IntMu:\\XboxInputCompatProbe.log",
 	"MmcMu:\\XboxInputCompatProbe.log",
 };
@@ -1813,6 +1821,18 @@ static UsbTrb  g_gipOutTrb;
 static BYTE    g_gipOutBuf[GIP_TX_BUFS][64];
 static int     g_gipOutBufIdx = 0;
 static bool    g_gipOutOpen = false;
+// Rumble is called by XAM far more frequently than actual motor state changes.
+// UsbdQueueAsyncTransfer is asynchronous, so reusing g_gipOutTrb for each call
+// while the USB core still owns it corrupts the transfer list.  Keep exactly one
+// rumble transfer in flight and coalesce any newer request behind it.
+static BYTE    g_gipRumbleBuf[64];
+static volatile LONG g_gipRumbleInFlight = 0;
+static volatile LONG g_gipRumblePending = 0;
+static BYTE    g_gipRumbleRequestedLeft = 0;
+static BYTE    g_gipRumbleRequestedRight = 0;
+static BYTE    g_gipRumbleLastLeft = 0;
+static BYTE    g_gipRumbleLastRight = 0;
+static bool    g_gipRumbleHaveLast = false;
 static uint8_t g_gipSeq = 1;
 static bool    g_gipIdentifySent = false;
 // A controller repeats ANNOUNCE until it receives IDENTIFY.  The original
@@ -1859,8 +1879,16 @@ struct GipSessionSlot {
 	UsbTrb                  outTrb;
 	BYTE                    readBuf[GIP_READ_BUF_SIZE];
 	BYTE                    outBuf[GIP_TX_BUFS][64];
+	BYTE                    rumbleBuf[64];
 	int                     outBufIndex;
 	bool                    outOpen;
+	volatile LONG           rumbleInFlight;
+	volatile LONG           rumblePending;
+	BYTE                    rumbleRequestedLeft;
+	BYTE                    rumbleRequestedRight;
+	BYTE                    rumbleLastLeft;
+	BYTE                    rumbleLastRight;
+	bool                    rumbleHaveLast;
 	uint8_t                 sequence;
 	bool                    identifySent;
 	bool                    identifyReplySeen;
@@ -1931,6 +1959,49 @@ static uint8_t GipNextSeq() {
 	return s;
 }
 
+static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor);
+
+// Completion callbacks execute in the USB stack.  Do not log or allocate here;
+// either release the single-flight gate or immediately submit the newest cached
+// state.  A new XAM caller that wins the gate first simply owns the next transfer.
+static int32_t GipGamepadRumbleComplete(DWORD trbAddr, int32_t status) {
+	UNREFERENCED_PARAMETER(trbAddr);
+	InterlockedExchange(&g_gipRumbleInFlight, 0);
+	if (!g_gipOutOpen || !g_gipExt.deviceHandle)
+		return status;
+	if (InterlockedExchange(&g_gipRumblePending, 0) == 0)
+		return status;
+	if (InterlockedCompareExchange(&g_gipRumbleInFlight, 1, 0) != 0)
+		return status;
+	int queued = GipQueueGamepadRumble(g_gipExt.deviceHandle,
+		g_gipRumbleRequestedLeft, g_gipRumbleRequestedRight);
+	if (queued != 0)
+		InterlockedExchange(&g_gipRumbleInFlight, 0);
+	return status;
+}
+
+static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor) {
+	if (!g_gipOutOpen || !h)
+		return -1;
+	const BYTE payload[9] = {
+		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
+		0xFF, 0x00, 0x00
+	};
+	int i = 0;
+	g_gipRumbleBuf[i++] = GIP_CMD_RUMBLE;
+	g_gipRumbleBuf[i++] = 0x00;
+	g_gipRumbleBuf[i++] = GipNextSeq();
+	g_gipRumbleBuf[i++] = (BYTE)sizeof(payload);
+	memcpy(g_gipRumbleBuf + i, payload, sizeof(payload));
+	i += sizeof(payload);
+	g_gipOutTrb.buffer = g_gipRumbleBuf;
+	g_gipOutTrb.length = i;
+	g_gipOutTrb.flags = 1;
+	g_gipOutTrb.callback = (DWORD)GipGamepadRumbleComplete;
+	g_gipOutTrb.savedEndpoint = g_gipOutTrb.endpoint;
+	return UsbdQueueAsyncTransfer(h, &g_gipOutTrb);
+}
+
 //
 // Build and send one GIP packet on the interrupt OUT endpoint.
 // All packets we send have payloads well under 128 bytes, so the length varint is a
@@ -1968,11 +2039,24 @@ static int GipSend(deviceHandle* h, uint8_t cmd, uint8_t options,
 // sequence and a 9-byte payload. The second payload byte enables both grip
 // motors; the next two are the trigger motors, which have no 360 equivalent.
 static int GipSendGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor) {
-	const BYTE payload[9] = {
-		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
-		0xFF, 0x00, 0x00
-	};
-	return GipSend(h, GIP_CMD_RUMBLE, 0x00, payload, sizeof(payload));
+	if (!h || !g_gipOutOpen)
+		return -1;
+	if (g_gipRumbleHaveLast && leftMotor == g_gipRumbleLastLeft &&
+		rightMotor == g_gipRumbleLastRight)
+		return 0;
+	g_gipRumbleHaveLast = true;
+	g_gipRumbleLastLeft = leftMotor;
+	g_gipRumbleLastRight = rightMotor;
+	g_gipRumbleRequestedLeft = leftMotor;
+	g_gipRumbleRequestedRight = rightMotor;
+	if (InterlockedCompareExchange(&g_gipRumbleInFlight, 1, 0) != 0) {
+		InterlockedExchange(&g_gipRumblePending, 1);
+		return 0;
+	}
+	int queued = GipQueueGamepadRumble(h, leftMotor, rightMotor);
+	if (queued != 0)
+		InterlockedExchange(&g_gipRumbleInFlight, 0);
+	return queued;
 }
 
 // Session-local outbound path used by the multi-controller implementation.  It
@@ -2020,12 +2104,73 @@ static int GipSessionSendSeq(GipSessionSlot* session, uint8_t cmd, uint8_t optio
 	return 0;
 }
 
-static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
+static int GipSessionQueueRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor);
+
+static int32_t GipSessionRumbleComplete(DWORD trbAddr, int32_t status) {
+	GipSessionSlot* session = 0;
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if ((DWORD)&g_gipSessions[i].outTrb == trbAddr) {
+			session = &g_gipSessions[i];
+			break;
+		}
+	}
+	if (!session)
+		return status;
+	InterlockedExchange(&session->rumbleInFlight, 0);
+	if (!session->reserved || !session->outOpen || !session->ext.deviceHandle)
+		return status;
+	if (InterlockedExchange(&session->rumblePending, 0) == 0)
+		return status;
+	if (InterlockedCompareExchange(&session->rumbleInFlight, 1, 0) != 0)
+		return status;
+	int queued = GipSessionQueueRumble(session,
+		session->rumbleRequestedLeft, session->rumbleRequestedRight);
+	if (queued != 0)
+		InterlockedExchange(&session->rumbleInFlight, 0);
+	return status;
+}
+
+static int GipSessionQueueRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
+	if (!session || !session->outOpen || !session->ext.deviceHandle)
+		return -1;
 	const BYTE payload[9] = {
 		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
 		0xFF, 0x00, 0x00
 	};
-	return GipSessionSend(session, GIP_CMD_RUMBLE, 0x00, payload, sizeof(payload));
+	int i = 0;
+	session->rumbleBuf[i++] = GIP_CMD_RUMBLE;
+	session->rumbleBuf[i++] = 0x00;
+	session->rumbleBuf[i++] = GipSessionNextSeq(session);
+	session->rumbleBuf[i++] = (BYTE)sizeof(payload);
+	memcpy(session->rumbleBuf + i, payload, sizeof(payload));
+	i += sizeof(payload);
+	session->outTrb.buffer = session->rumbleBuf;
+	session->outTrb.length = i;
+	session->outTrb.flags = 1;
+	session->outTrb.callback = (DWORD)GipSessionRumbleComplete;
+	session->outTrb.savedEndpoint = session->outTrb.endpoint;
+	return UsbdQueueAsyncTransfer(session->ext.deviceHandle, &session->outTrb);
+}
+
+static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
+	if (!session || !session->outOpen || !session->ext.deviceHandle)
+		return -1;
+	if (session->rumbleHaveLast && leftMotor == session->rumbleLastLeft &&
+		rightMotor == session->rumbleLastRight)
+		return 0;
+	session->rumbleHaveLast = true;
+	session->rumbleLastLeft = leftMotor;
+	session->rumbleLastRight = rightMotor;
+	session->rumbleRequestedLeft = leftMotor;
+	session->rumbleRequestedRight = rightMotor;
+	if (InterlockedCompareExchange(&session->rumbleInFlight, 1, 0) != 0) {
+		InterlockedExchange(&session->rumblePending, 1);
+		return 0;
+	}
+	int queued = GipSessionQueueRumble(session, leftMotor, rightMotor);
+	if (queued != 0)
+		InterlockedExchange(&session->rumbleInFlight, 0);
+	return queued;
 }
 
 //
