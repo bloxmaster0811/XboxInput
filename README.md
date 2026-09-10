@@ -1,5 +1,6 @@
 # XboxInput  — Use Xbox One/Series Controllers on your modded Xbox 360!
-![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/bloxmaster0811/XboxInput/latest/total?logo=github&link=https%3A%2F%2Fgithub.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F) ![GitHub Release](https://img.shields.io/github/v/release/bloxmaster0811/XboxInput?style=flat&logo=github&link=https%3A%2F%2Fgithub.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/bloxmaster0811/XboxInput/total?logo=github&link=github.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F)
+ ![GitHub Release](https://img.shields.io/github/v/release/bloxmaster0811/XboxInput?style=flat&logo=github&link=https%3A%2F%2Fgithub.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F)
  ![GitHub Repo stars](https://img.shields.io/github/stars/bloxmaster0811/XboxInput?style=flat&logo=github)
 
 
