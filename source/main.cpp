@@ -109,19 +109,57 @@ static const char* const kXboxInputLogPaths[] = {
 	"IntMu:\\XboxInputGip.log",
 	"MmcMu:\\XboxInputGip.log",
 };
-static const char* XboxInputKnownControllerName(uint16_t pid);
+static const char* XboxInputKnownControllerName(uint16_t vid, uint16_t pid);
 
 // USB callbacks can run above PASSIVE_LEVEL, so they queue compact events here.
 // The existing logger thread is the only code that writes them to HDD.
-#define XBOXINPUT_LOG_EVENT_COUNT 32
+#define XBOXINPUT_LOG_EVENT_COUNT 128
 enum XboxInputLogEventType {
 	XBOXINPUT_LOG_CONTROLLER_DETECTED = 1,
 	XBOXINPUT_LOG_CONTROLLER_READY = 2,
 	XBOXINPUT_LOG_CONTROLLER_REMOVED = 3,
 	XBOXINPUT_LOG_USB_FAILURE = 4,
+	XBOXINPUT_LOG_INIT_STEP = 5,
+	XBOXINPUT_LOG_USB_STEP = 6,
+	XBOXINPUT_LOG_FIRST_INPUT = 7,
+	XBOXINPUT_LOG_RUMBLE = 8,
+};
+
+enum XboxInputInitStep {
+	XBOXINPUT_INIT_ENTRY = 1,
+	XBOXINPUT_INIT_LOGGER_STARTED,
+	XBOXINPUT_INIT_ENVIRONMENT,
+	XBOXINPUT_INIT_CONFIG_LOADED,
+	XBOXINPUT_INIT_FUNCTIONS_READY,
+	XBOXINPUT_INIT_USB_HOOKS_READY,
+	XBOXINPUT_INIT_XAM_HOOKS_READY,
+	XBOXINPUT_INIT_USB_RESET_SKIPPED,
+	XBOXINPUT_INIT_COMPLETE,
+	XBOXINPUT_INIT_ABORT_UNSUPPORTED,
+	XBOXINPUT_INIT_ABORT_FUNCTIONS,
+};
+
+enum XboxInputUsbStep {
+	XBOXINPUT_USB_CANDIDATE = 1,
+	XBOXINPUT_USB_CLAIM_BEGIN,
+	XBOXINPUT_USB_CLAIM_COMPLETE,
+	XBOXINPUT_USB_DEFAULT_ENDPOINT_OPEN,
+	XBOXINPUT_USB_SET_CONFIG_QUEUED,
+	XBOXINPUT_USB_SET_CONFIG_COMPLETE,
+	XBOXINPUT_USB_INTERRUPT_IN_OPEN,
+	XBOXINPUT_USB_INTERRUPT_OUT_OPEN,
+	XBOXINPUT_USB_READ_QUEUED,
+	XBOXINPUT_USB_ANNOUNCE,
+	XBOXINPUT_USB_IDENTIFY_SENT,
+	XBOXINPUT_USB_IDENTIFY_COMPLETE,
+	XBOXINPUT_USB_XAM_REGISTER,
+	XBOXINPUT_USB_REMOVE_BEGIN,
+	XBOXINPUT_USB_REMOVE_COMPLETE,
+	XBOXINPUT_USB_POWERA_STAGE = 100,
 };
 struct XboxInputLogEvent {
 	volatile LONG serial; // Published last by the producer.
+	DWORD tick;
 	DWORD type;
 	DWORD value1;
 	DWORD value2;
@@ -134,6 +172,7 @@ static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
 	XboxInputLogEvent* event =
 		&g_xboxInputLogEvents[(serial - 1) % XBOXINPUT_LOG_EVENT_COUNT];
 	event->serial = 0;
+	event->tick = GetTickCount();
 	event->type = type;
 	event->value1 = value1;
 	event->value2 = value2;
@@ -168,6 +207,45 @@ static volatile LONG g_xboxInputDiagStage = 0;
 static volatile DWORD g_xboxInputGuideCaller = 0;
 static volatile DWORD g_xboxInputGuideUiState = 0;
 static volatile LONG g_xboxInputLogPathIndex = -1;
+static volatile LONG g_xboxInputLoggerReady = 0;
+
+static const char* XboxInputInitStepName(DWORD step) {
+	switch (step) {
+	case XBOXINPUT_INIT_ENTRY: return "dll_entry";
+	case XBOXINPUT_INIT_LOGGER_STARTED: return "logger_thread_started";
+	case XBOXINPUT_INIT_ENVIRONMENT: return "environment_checked";
+	case XBOXINPUT_INIT_CONFIG_LOADED: return "config_loaded";
+	case XBOXINPUT_INIT_FUNCTIONS_READY: return "function_pointers_ready";
+	case XBOXINPUT_INIT_USB_HOOKS_READY: return "usb_hooks_installed";
+	case XBOXINPUT_INIT_XAM_HOOKS_READY: return "xam_hooks_installed";
+	case XBOXINPUT_INIT_USB_RESET_SKIPPED: return "usb_reset_skipped";
+	case XBOXINPUT_INIT_COMPLETE: return "startup_complete";
+	case XBOXINPUT_INIT_ABORT_UNSUPPORTED: return "startup_inert_unsupported_environment";
+	case XBOXINPUT_INIT_ABORT_FUNCTIONS: return "startup_inert_function_resolution_failed";
+	default: return "unknown";
+	}
+}
+
+static const char* XboxInputUsbStepName(DWORD step) {
+	switch (step) {
+	case XBOXINPUT_USB_CANDIDATE: return "supported_candidate_seen";
+	case XBOXINPUT_USB_CLAIM_BEGIN: return "claim_begin";
+	case XBOXINPUT_USB_CLAIM_COMPLETE: return "claim_complete";
+	case XBOXINPUT_USB_DEFAULT_ENDPOINT_OPEN: return "default_endpoint_open";
+	case XBOXINPUT_USB_SET_CONFIG_QUEUED: return "set_configuration_queued";
+	case XBOXINPUT_USB_SET_CONFIG_COMPLETE: return "set_configuration_complete";
+	case XBOXINPUT_USB_INTERRUPT_IN_OPEN: return "interrupt_in_open";
+	case XBOXINPUT_USB_INTERRUPT_OUT_OPEN: return "interrupt_out_open";
+	case XBOXINPUT_USB_READ_QUEUED: return "first_interrupt_read_queued";
+	case XBOXINPUT_USB_ANNOUNCE: return "announce_received";
+	case XBOXINPUT_USB_IDENTIFY_SENT: return "identify_sent";
+	case XBOXINPUT_USB_IDENTIFY_COMPLETE: return "identify_complete";
+	case XBOXINPUT_USB_XAM_REGISTER: return "xam_registered";
+	case XBOXINPUT_USB_REMOVE_BEGIN: return "remove_begin";
+	case XBOXINPUT_USB_REMOVE_COMPLETE: return "remove_complete";
+	default: return step >= XBOXINPUT_USB_POWERA_STAGE ? "powera_init_stage" : "unknown";
+	}
+}
 
 static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
 	const DWORD pathCount = sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0]);
@@ -281,6 +359,38 @@ static void GipRestoreUsbBugchecks() {
 	}
 }
 
+#ifdef XBOXINPUT_RESTORE_WGC_MATCH
+// XeUnshackle includes both halves of UsbdSecPatch.  The authentication bypass
+// is useful to us, but its second patch changes WgcAddDevice's descriptor test
+// from a conditional branch to an unconditional one.  That can let the stock
+// XUSB driver claim a GIP controller before this plugin sees it as unclaimed.
+//
+// This diagnostic restores only the original 17559 conditional branch.  It is
+// intentionally guarded by the exact patched opcode: never overwrite an
+// unknown kernel or another project's different modification.
+static DWORD g_xboxInputWgcOpcodeBefore = 0;
+static DWORD g_xboxInputWgcOpcodeAfter = 0;
+
+static void XboxInputRestoreWgcDescriptorCheck() {
+	const DWORD kWgcMatchAddress = 0x800F98E0;
+	const DWORD kXeUnshackleOpcode = 0x48000010;
+	const DWORD kRetail17559Opcode = 0x409A0010;
+
+	if (XboxKrnlVersion->Build != 17559)
+		return;
+
+	volatile DWORD* instruction = (volatile DWORD*)kWgcMatchAddress;
+	g_xboxInputWgcOpcodeBefore = *instruction;
+	if (g_xboxInputWgcOpcodeBefore == kXeUnshackleOpcode) {
+		*instruction = kRetail17559Opcode;
+		doSync((void*)instruction);
+	}
+	g_xboxInputWgcOpcodeAfter = *instruction;
+	RM_LOG("XBOXINPUT: WGC descriptor branch %08X -> %08X\r\n",
+		g_xboxInputWgcOpcodeBefore, g_xboxInputWgcOpcodeAfter);
+}
+#endif
+
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
 Detour XamInputSetStateDetour;
@@ -302,30 +412,177 @@ BOOL IsTrayOpen() {
 // This console likes to kill non system threads on title switches
 HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 	HANDLE Handle = 0;
-	ExCreateThread(&Handle, 0, 0, XapiThreadStartup, Address, arg, (EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424));
+	NTSTATUS status = ExCreateThread(&Handle, 0, 0, XapiThreadStartup, Address, arg,
+		(EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424));
+	if (status < 0 || !Handle) {
+		DbgPrint("XBOXINPUT: ExCreateThread failed status=%08X handle=%p\r\n", status, Handle);
+		return NULL;
+	}
 	XSetThreadProcessor(Handle, 4);
 	SetThreadPriority(Handle, THREAD_PRIORITY_NORMAL);
 	ResumeThread(Handle);
 	return Handle;
 }
 
+static bool XboxInputFinishLogWrite(FILE* file) {
+	if (!file)
+		return false;
+	int flushResult = fflush(file);
+	int streamError = ferror(file);
+	int closeResult = fclose(file);
+	return flushResult == 0 && streamError == 0 && closeResult == 0;
+}
+
+// When HDD: is the primary log, mirror the complete file to every other mounted
+// storage root. This is intentionally a snapshot copy rather than a second set of
+// event cursors: a USB device inserted later still receives the full startup history,
+// and an internal HDD cannot hide the diagnostics from a BadAvatar/BadUpdate user.
+// Called only by XboxInputLogThread, never by DllMain or a USB callback.
+static bool XboxInputLogFilesEqual(FILE* source, const char* destinationPath) {
+	FILE* destination = fopen(destinationPath, "rb");
+	if (!destination)
+		return false;
+	BYTE sourceBuffer[512];
+	BYTE destinationBuffer[512];
+	bool equal = true;
+	fseek(source, 0, SEEK_SET);
+	for (;;) {
+		size_t sourceBytes = fread(sourceBuffer, 1, sizeof(sourceBuffer), source);
+		size_t destinationBytes = fread(destinationBuffer, 1, sizeof(destinationBuffer), destination);
+		if (sourceBytes != destinationBytes ||
+			(sourceBytes && memcmp(sourceBuffer, destinationBuffer, sourceBytes) != 0)) {
+			equal = false;
+			break;
+		}
+		if (sourceBytes < sizeof(sourceBuffer)) {
+			if (ferror(source) || ferror(destination))
+				equal = false;
+			break;
+		}
+	}
+	fclose(destination);
+	fseek(source, 0, SEEK_SET);
+	return equal;
+}
+
+static void XboxInputMirrorOneLog(const char* sourcePath, const char* destinationPath) {
+	FILE* source = fopen(sourcePath, "rb");
+	if (!source)
+		return;
+	// Polling discovers USB devices inserted after boot, but identical files incur
+	// reads only. Avoid repeatedly truncating and rewriting removable media.
+	if (XboxInputLogFilesEqual(source, destinationPath)) {
+		fclose(source);
+		return;
+	}
+	FILE* destination = fopen(destinationPath, "wb");
+	if (!destination) {
+		fclose(source);
+		return;
+	}
+
+	BYTE buffer[512];
+	bool ok = true;
+	for (;;) {
+		size_t got = fread(buffer, 1, sizeof(buffer), source);
+		if (got && fwrite(buffer, 1, got, destination) != got) {
+			ok = false;
+			break;
+		}
+		if (got < sizeof(buffer)) {
+			if (ferror(source))
+				ok = false;
+			break;
+		}
+	}
+	if (fflush(destination) != 0 || ferror(destination))
+		ok = false;
+	if (fclose(destination) != 0)
+		ok = false;
+	fclose(source);
+	UNREFERENCED_PARAMETER(ok); // A failed/partial mirror is replaced on the next pass.
+}
+
+static void XboxInputMirrorLogsToOtherStorage() {
+	// Index zero is HDD:. If another device became the primary, the log is already
+	// removable and copying between potentially aliased Usb:/Usb0: names could
+	// truncate the source. The HDD -> removable direction has no aliasing hazard.
+	if (g_xboxInputLogPathIndex != 0)
+		return;
+	// Mirror only to removable USB names. Do not generate continuous diagnostic
+	// copies on internal flash/MU devices merely because HDD: also exists.
+	static const BYTE usbPathIndices[] = { 1, 2, 3, 6 }; // Usb, Usb0, Usb1, UsbMu
+	for (DWORD n = 0; n < sizeof(usbPathIndices) / sizeof(usbPathIndices[0]); ++n) {
+		DWORD i = usbPathIndices[n];
+		XboxInputMirrorOneLog(kXboxInputLogPaths[0], kXboxInputLogPaths[i]);
+#ifdef XBOXINPUT_COMPAT_PROBE
+		XboxInputMirrorOneLog(kXboxInputCompatProbeLogPaths[0],
+			kXboxInputCompatProbeLogPaths[i]);
+#endif
+	}
+}
+
 static DWORD XboxInputLogThread(PVOID) {
+	// Storage devices are not guaranteed to be mounted when DashLaunch calls
+	// DllMain.  Keep retrying forever: a late HDD/USB mount must still result in
+	// a log containing all initialization events retained in the ring.
+	for (;;) {
+		FILE* file = XboxInputOpenLog(false, "w");
+		if (file) {
+			LONG pathIndex = g_xboxInputLogPathIndex;
+			fprintf(file, "XboxInput detailed diagnostic log\r\n");
+			fprintf(file, "build=%s %s kernel=%u ladder=%u\r\n",
+				__DATE__, __TIME__, XboxKrnlVersion->Build,
+				(DWORD)RIFFMASTER_LEVEL);
+			fprintf(file, "logPath=%s retryPolicy=continuous eventBuffer=%u\r\n",
+				(pathIndex >= 0 && pathIndex < (LONG)(sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0])))
+					? kXboxInputLogPaths[pathIndex] : "unknown",
+				(DWORD)XBOXINPUT_LOG_EVENT_COUNT);
+			if (XboxInputFinishLogWrite(file)) {
+				InterlockedExchange(&g_xboxInputLoggerReady, 1);
+				break;
+			}
+		}
+		Sleep(250);
+	}
+#ifdef XBOXINPUT_COMPAT_PROBE
+	// The normal log selected a writable device. Reset the companion file here,
+	// never in DllMain or a USB callback.
+	FILE* compatReset = XboxInputOpenLog(true, "w");
+	if (compatReset)
+		XboxInputFinishLogWrite(compatReset);
+#endif
+
 	LONG written = -1;
 	DWORD writtenGuideCaller = 0;
 	DWORD writtenGuideUiState = 0;
 	LONG writtenEventSerial = 0;
+#ifdef XBOXINPUT_RESTORE_WGC_MATCH
+	bool wroteWgcPatchState = false;
+#endif
 #ifdef XBOXINPUT_COMPAT_PROBE
 	LONG writtenProbeSerial = 0;
 #endif
+	DWORD lastMirrorTick = 0;
 	for (;;) {
+#ifdef XBOXINPUT_RESTORE_WGC_MATCH
+		if (!wroteWgcPatchState) {
+			FILE* file = XboxInputOpenLog(false, "a");
+			if (file) {
+				fprintf(file, "wgcDescriptorBranch=%08X->%08X\r\n",
+					g_xboxInputWgcOpcodeBefore, g_xboxInputWgcOpcodeAfter);
+				wroteWgcPatchState = XboxInputFinishLogWrite(file);
+			}
+		}
+#endif
 		LONG stage = g_xboxInputDiagStage;
 		if (stage != written) {
 			FILE* file = XboxInputOpenLog(false, "a");
 			if (file) {
 				fprintf(file, "stage=%ld\r\n", stage);
-				fclose(file);
+				if (XboxInputFinishLogWrite(file))
+					written = stage;
 			}
-			written = stage;
 		}
 		DWORD guideCaller = g_xboxInputGuideCaller;
 		DWORD guideUiState = g_xboxInputGuideUiState;
@@ -335,12 +592,23 @@ static DWORD XboxInputLogThread(PVOID) {
 			if (file) {
 				fprintf(file, "guideCaller=%08X xenonUi=%u\r\n",
 					guideCaller, guideUiState);
-				fclose(file);
+				if (XboxInputFinishLogWrite(file)) {
+					writtenGuideCaller = guideCaller;
+					writtenGuideUiState = guideUiState;
+				}
 			}
-			writtenGuideCaller = guideCaller;
-			writtenGuideUiState = guideUiState;
 		}
 		LONG eventSerial = g_xboxInputLogEventSerial;
+		if (eventSerial - writtenEventSerial > XBOXINPUT_LOG_EVENT_COUNT) {
+			LONG dropped = eventSerial - writtenEventSerial - XBOXINPUT_LOG_EVENT_COUNT;
+			FILE* overflow = XboxInputOpenLog(false, "a");
+			if (overflow) {
+				fprintf(overflow, "tick=%lu event=logger_overflow dropped=%ld\r\n",
+					GetTickCount(), dropped);
+				if (XboxInputFinishLogWrite(overflow))
+					writtenEventSerial = eventSerial - XBOXINPUT_LOG_EVENT_COUNT;
+			}
+		}
 		while (writtenEventSerial < eventSerial) {
 			LONG wanted = writtenEventSerial + 1;
 			XboxInputLogEvent* event =
@@ -351,29 +619,58 @@ static DWORD XboxInputLogThread(PVOID) {
 			if (file) {
 				switch (event->type) {
 				case XBOXINPUT_LOG_CONTROLLER_DETECTED:
-					fprintf(file, "event=controller_detected vid=%04X pid=%04X model=%s interface=%u endpoints=%u\r\n",
+					fprintf(file, "tick=%lu event=controller_detected vid=%04X pid=%04X model=%s interface=%u endpoints=%u\r\n",
+						event->tick,
 						(WORD)(event->value1 >> 16), (WORD)event->value1,
-						XboxInputKnownControllerName((WORD)event->value1),
+						XboxInputKnownControllerName((WORD)(event->value1 >> 16),
+							(WORD)event->value1),
 						(BYTE)(event->value2 >> 8), (BYTE)event->value2);
 					break;
 				case XBOXINPUT_LOG_CONTROLLER_READY:
-					fprintf(file, "event=controller_ready user=%u context=%08X\r\n",
-						(BYTE)event->value1, event->value2);
+					fprintf(file, "tick=%lu event=controller_ready user=%u context=%08X\r\n",
+						event->tick, (BYTE)event->value1, event->value2);
 					break;
 				case XBOXINPUT_LOG_CONTROLLER_REMOVED:
-					fprintf(file, "event=controller_removed user=%u\r\n", (BYTE)event->value1);
+					fprintf(file, "tick=%lu event=controller_removed user=%u\r\n",
+						event->tick, (BYTE)event->value1);
 					break;
 				case XBOXINPUT_LOG_USB_FAILURE:
-					fprintf(file, "event=usb_failure step=%u status=%08X\r\n",
-						event->value1, event->value2);
+					fprintf(file, "tick=%lu event=usb_failure step=%u status=%08X\r\n",
+						event->tick, event->value1, event->value2);
+					break;
+				case XBOXINPUT_LOG_INIT_STEP:
+					fprintf(file, "tick=%lu event=init step=%u name=%s value=%08X\r\n",
+						event->tick, event->value1,
+						XboxInputInitStepName(event->value1), event->value2);
+					break;
+				case XBOXINPUT_LOG_USB_STEP:
+					fprintf(file, "tick=%lu event=usb_step step=%u name=%s value=%08X\r\n",
+						event->tick, event->value1,
+						XboxInputUsbStepName(event->value1), event->value2);
+					break;
+				case XBOXINPUT_LOG_FIRST_INPUT:
+					fprintf(file, "tick=%lu event=first_input user=%u packet=%u\r\n",
+						event->tick, event->value1, event->value2);
+					break;
+				case XBOXINPUT_LOG_RUMBLE:
+					fprintf(file, "tick=%lu event=rumble user=%u motors=%08X\r\n",
+						event->tick, event->value1, event->value2);
+					break;
+				default:
+					fprintf(file, "tick=%lu event=unknown type=%u value1=%08X value2=%08X\r\n",
+						event->tick, event->type, event->value1, event->value2);
 					break;
 				}
-				fclose(file);
+				if (XboxInputFinishLogWrite(file))
+					writtenEventSerial = wanted;
 			}
-			writtenEventSerial = wanted;
+			else
+				break; // Storage is not ready yet; retry this record next pass.
 		}
 #ifdef XBOXINPUT_COMPAT_PROBE
 		LONG probeSerial = g_xboxInputCompatProbeSerial;
+		if (probeSerial - writtenProbeSerial > XBOXINPUT_COMPAT_PROBE_RECORDS)
+			writtenProbeSerial = probeSerial - XBOXINPUT_COMPAT_PROBE_RECORDS;
 		while (writtenProbeSerial < probeSerial) {
 			LONG wanted = writtenProbeSerial + 1;
 			XboxInputCompatProbeRecord* record =
@@ -390,11 +687,20 @@ static DWORD XboxInputLogThread(PVOID) {
 					(BYTE)(dc >> 16), (BYTE)(dc >> 8), (BYTE)dc,
 					(BYTE)(iface >> 24), (BYTE)(iface >> 16),
 					(BYTE)(iface >> 8), (BYTE)iface, (BYTE)record->protocol);
-				fclose(probe);
+				if (XboxInputFinishLogWrite(probe))
+					writtenProbeSerial = wanted;
 			}
-			writtenProbeSerial = wanted;
+			else
+				break; // Storage is not ready yet; retry this record next pass.
 		}
 #endif
+		// Re-copy periodically even when no new event was generated. This lets a USB
+		// device connected after boot receive the complete existing HDD log.
+		DWORD mirrorTick = GetTickCount();
+		if ((DWORD)(mirrorTick - lastMirrorTick) >= 2000) {
+			XboxInputMirrorLogsToOtherStorage();
+			lastMirrorTick = mirrorTick;
+		}
 		Sleep(250);
 	}
 }
@@ -1747,7 +2053,18 @@ int UsbdGetDeviceSpeedHook(deviceHandle* h) {
 // other Microsoft GIP-class devices include adapters and accessories, which
 // must never be claimed as a gamepad.
 const uint16_t MICROSOFT_VENDOR_ID = 0x045E;
-static const char* XboxInputKnownControllerName(uint16_t pid) {
+const uint16_t POWERA_VENDOR_ID = 0x24C6;
+const uint16_t POWERA_1414134_PID = 0x543A;
+
+static bool IsPowerA1414134(uint16_t vid, uint16_t pid) {
+	return vid == POWERA_VENDOR_ID && pid == POWERA_1414134_PID;
+}
+
+static const char* XboxInputKnownControllerName(uint16_t vid, uint16_t pid) {
+	if (IsPowerA1414134(vid, pid))
+		return "PowerA Xbox One Wired (1414134-01)";
+	if (vid != MICROSOFT_VENDOR_ID)
+		return "Unknown";
 	switch (pid) {
 	case 0x02D1: return "Xbox One";
 	case 0x02DD: return "Xbox One (2015)";
@@ -1795,6 +2112,8 @@ static bool IsSupportedMicrosoftGamepadPid(uint16_t pid) {
 #define GIP_CLAIM_MAX_ATTEMPTS 3
 static int g_gipClaimAttempts = 0;
 static HidControllerExtension g_gipExt;
+static uint16_t g_gipVendorId = 0;
+static uint16_t g_gipProductId = 0;
 
 // Read buffer for the GIP interrupt IN endpoint. wMaxPacketSize is 64
 // (docs/gip_riffmaster.md section 2, read from the descriptor, not assumed).
@@ -1841,6 +2160,23 @@ static bool    g_gipIdentifySent = false;
 static bool    g_gipIdentifyReplySeen = false;
 static DWORD   g_gipLastIdentifyTick = 0;
 static bool    g_gipPoweredOn = false;
+// PowerA 24C6:543A needs a host-initiated POWER packet before ANNOUNCE and a
+// short, ordered post-IDENTIFY sequence before it starts reporting input.
+// Keep this entirely separate from normal rumble so every init transfer owns
+// the OUT TRB until its completion callback fires.
+enum PowerAInitStage {
+	POWERA_INIT_IDLE = 0,
+	POWERA_INIT_EARLY_POWER,
+	POWERA_INIT_WAIT_IDENTIFY,
+	POWERA_INIT_LED,
+	POWERA_INIT_AUTH_DONE,
+	POWERA_INIT_RUMBLE_START,
+	POWERA_INIT_RUMBLE_STOP,
+	POWERA_INIT_COMPLETE,
+};
+static volatile LONG g_powerAInitStage = POWERA_INIT_IDLE;
+static volatile LONG g_powerAIdentifyComplete = 0;
+static BYTE g_powerAInitBuf[64];
 // The normal wired gamepad does not use the RiffMaster dongle's RSA path.
 static bool    g_gipAuthStarted = true;
 static uint32_t g_gipChunkTotal = 0;
@@ -1959,6 +2295,11 @@ static uint8_t GipNextSeq() {
 	return s;
 }
 
+static bool IsSupportedGipGamepad(uint16_t vid, uint16_t pid) {
+	return (vid == MICROSOFT_VENDOR_ID && IsSupportedMicrosoftGamepadPid(pid)) ||
+		IsPowerA1414134(vid, pid);
+}
+
 static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor);
 
 // Completion callbacks execute in the USB stack.  Do not log or allocate here;
@@ -2049,6 +2390,9 @@ static int GipSendGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor
 	g_gipRumbleLastRight = rightMotor;
 	g_gipRumbleRequestedLeft = leftMotor;
 	g_gipRumbleRequestedRight = rightMotor;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_RUMBLE,
+		0xFF, // primary slot is recorded by controller_ready; avoid hot-path lookup here
+		((DWORD)leftMotor << 8) | rightMotor);
 	if (InterlockedCompareExchange(&g_gipRumbleInFlight, 1, 0) != 0) {
 		InterlockedExchange(&g_gipRumblePending, 1);
 		return 0;
@@ -2256,6 +2600,93 @@ static void GipSendChunked(deviceHandle* h, BYTE cmd, const BYTE* data, int tota
 static void GipRegisterWithXam();
 static void GipFillGuitarCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad);
 static void GipUnregisterFromXam();
+
+static int GipPowerAQueueStage(LONG stage);
+
+static int32_t GipPowerAInitComplete(DWORD trbAddr, int32_t status) {
+	UNREFERENCED_PARAMETER(trbAddr);
+	LONG completed = g_powerAInitStage;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+		XBOXINPUT_USB_POWERA_STAGE + completed, status);
+	if (status != 0 || !g_gipOutOpen || !g_gipExt.deviceHandle) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 70 + completed, status);
+		return status;
+	}
+
+	if (completed == POWERA_INIT_EARLY_POWER) {
+		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_WAIT_IDENTIFY);
+		// A very fast controller may finish IDENTIFY while POWER is completing.
+		if (InterlockedCompareExchange(&g_powerAIdentifyComplete, 0, 0) != 0)
+			return GipPowerAQueueStage(POWERA_INIT_LED);
+		return status;
+	}
+
+	if (completed >= POWERA_INIT_LED && completed < POWERA_INIT_RUMBLE_STOP)
+		return GipPowerAQueueStage(completed + 1);
+
+	if (completed == POWERA_INIT_RUMBLE_STOP) {
+		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_COMPLETE);
+		if (!g_gipReady) {
+			g_gipReady = true;
+			g_gipClaimAttempts = 0;
+			GipRegisterWithXam();
+		}
+	}
+	return status;
+}
+
+static int GipPowerAQueueStage(LONG stage) {
+	if (!g_gipOutOpen || !g_gipExt.deviceHandle || !IsPowerA1414134(g_gipVendorId, g_gipProductId))
+		return -1;
+
+	BYTE command = 0;
+	BYTE options = 0;
+	const BYTE* payload = 0;
+	int payloadLen = 0;
+	static const BYTE powerOn[1] = { 0x00 };
+	static const BYTE ledOn[3] = { 0x00, 0x01, 0x14 };
+	static const BYTE authDone[2] = { 0x01, 0x00 };
+	static const BYTE rumbleStart[9] = {
+		0x00, 0x0F, 0x00, 0x00, 0x1D, 0x1D, 0xFF, 0x00, 0x00
+	};
+	static const BYTE rumbleStop[9] = {
+		0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+
+	switch (stage) {
+	case POWERA_INIT_EARLY_POWER:
+		command = GIP_CMD_POWER; options = GIP_OPT_INTERNAL;
+		payload = powerOn; payloadLen = sizeof(powerOn); break;
+	case POWERA_INIT_LED:
+		command = GIP_CMD_LED; options = GIP_OPT_INTERNAL;
+		payload = ledOn; payloadLen = sizeof(ledOn); break;
+	case POWERA_INIT_AUTH_DONE:
+		command = GIP_CMD_AUTHENTICATE; options = GIP_OPT_INTERNAL;
+		payload = authDone; payloadLen = sizeof(authDone); break;
+	case POWERA_INIT_RUMBLE_START:
+		command = GIP_CMD_RUMBLE; options = 0;
+		payload = rumbleStart; payloadLen = sizeof(rumbleStart); break;
+	case POWERA_INIT_RUMBLE_STOP:
+		command = GIP_CMD_RUMBLE; options = 0;
+		payload = rumbleStop; payloadLen = sizeof(rumbleStop); break;
+	default:
+		return -1;
+	}
+
+	int length = 0;
+	g_powerAInitBuf[length++] = command;
+	g_powerAInitBuf[length++] = options;
+	g_powerAInitBuf[length++] = GipNextSeq();
+	g_powerAInitBuf[length++] = (BYTE)payloadLen;
+	memcpy(g_powerAInitBuf + length, payload, payloadLen);
+	length += payloadLen;
+	InterlockedExchange(&g_powerAInitStage, stage);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+		XBOXINPUT_USB_POWERA_STAGE + stage, 0x80000000 | (DWORD)command);
+	SendInterruptRequest(g_gipExt.deviceHandle, &g_gipOutTrb,
+		g_powerAInitBuf, length, (DWORD)GipPowerAInitComplete);
+	return 0;
+}
 
 #define GIP_AUTH_CMD_HOST_SECRET 0x05
 #define GIP_AUTH_CMD_HOST_FINISH 0x07
@@ -2620,6 +3051,8 @@ static void GipRegisterWithXam() {
 
 	g_gipUserIndex = userIndex;
 	g_gipDeviceContext = context;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_XAM_REGISTER,
+		((DWORD)userIndex << 24) | (context & 0x00FFFFFF));
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, userIndex, context);
 	RM_LOG("XBOXINPUT: registered virtual GAMEPAD in XAM, user index %d\r\n",
 		userIndex);
@@ -2929,6 +3362,9 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 		switch (hdr.command) {
 		case GIP_CMD_ANNOUNCE: {
+			if (!g_gipIdentifySent)
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_ANNOUNCE,
+					hdr.sequence);
 			// Payload offsets 8-11 are VID/PID little-endian - verified in the capture.
 			// The controller will keep announcing until it sees IDENTIFY.  Re-send it
 			// at a modest rate until the first IDENTIFY reply proves the packet arrived.
@@ -2948,6 +3384,8 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				g_gipIdentifySent = true;
 				g_gipLastIdentifyTick = now;
 				g_gipChunkTotal = 0;
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_IDENTIFY_SENT,
+					retryIdentify ? 1 : 0);
 				GipSend(g_gipExt.deviceHandle, GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, 0, 0);
 			}
 			break;
@@ -2965,7 +3403,19 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 			if (hdr.packetLength == 0 && !g_gipPoweredOn) {
 				g_gipPoweredOn = true;
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_IDENTIFY_COMPLETE, 0);
 				RM_DBG("RIFFMASTER: -> identify complete, sending init sequence\r\n");
+
+				if (IsPowerA1414134(g_gipVendorId, g_gipProductId)) {
+					// The early POWER transfer is normally complete before IDENTIFY can
+					// finish. If it is still completing, its callback observes this flag
+					// and starts the ordered post-identify sequence itself.
+					InterlockedExchange(&g_powerAIdentifyComplete, 1);
+					if (InterlockedCompareExchange(&g_powerAInitStage, 0, 0) ==
+						POWERA_INIT_WAIT_IDENTIFY)
+						GipPowerAQueueStage(POWERA_INIT_LED);
+					break;
+				}
 
 				// Replay what the Windows host sent, in order, from the captured
 				// enumeration (docs/gip_riffmaster.md section 5 stage 2). Previously we
@@ -3171,6 +3621,9 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 		case GIP_CMD_INPUT:
 			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &g_gipState)) {
+				if (g_gipInputsSeen == 0)
+					XboxInputQueueLogEvent(XBOXINPUT_LOG_FIRST_INPUT,
+						g_gipUserIndex == 0xFF ? 0xFF : g_gipUserIndex, hdr.sequence);
 				g_gipInputsSeen++;
 				// Rate-limited: these arrive at ~40 Hz and would flood the log.
 				if (g_gipInputsSeen <= 3 || (g_gipInputsSeen % 400) == 0)
@@ -3386,6 +3839,7 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 //
 int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	XboxInputSetDiagStage(50);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_SET_CONFIG_COMPLETE, status);
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 36);
 
 	RM_LOG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
@@ -3445,6 +3899,8 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 
 	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
 		epAddr, pkt, interval, (DWORD*)&ext->interruptTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_INTERRUPT_IN_OPEN,
+		((DWORD)epAddr << 24) | ((DWORD)pkt << 8) | (NT_ERROR(s) ? 0x80 : interval));
 	if (NT_ERROR(s)) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 60, s);
 		RM_LOG("RIFFMASTER: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
@@ -3469,8 +3925,16 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		NTSTATUS os = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
 			outAddr, outPkt, outInterval, (DWORD*)&g_gipOutTrb);
 		g_gipOutOpen = !NT_ERROR(os);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_INTERRUPT_OUT_OPEN,
+			((DWORD)outAddr << 24) | ((DWORD)outPkt << 8) | (NT_ERROR(os) ? 0x80 : outInterval));
 		RM_LOG("RIFFMASTER: interrupt OUT EP %02X -> 0x%08X %s\r\n",
 			outAddr, os, g_gipOutOpen ? "OK" : "FAILED");
+		if (g_gipOutOpen && IsPowerA1414134(g_gipVendorId, g_gipProductId)) {
+			// 2015-era Xbox One firmware may not ANNOUNCE until the host powers it
+			// on. PowerA 24C6:543A additionally needs its post-IDENTIFY rumble kick.
+			if (GipPowerAQueueStage(POWERA_INIT_EARLY_POWER) != 0)
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 70, 0xFFFFFFFF);
+		}
 	}
 
 	if (pkt > GIP_READ_BUF_SIZE)
@@ -3493,7 +3957,9 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	ext->interruptTrb.buffer = g_gipReadBuf;
 	ext->interruptTrb.callback = (DWORD)GipInterruptComplete;
 	ext->interruptTrb.flags = 1;
-	return UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+	int32_t readQueued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, readQueued);
+	return readQueued;
 }
 
 // Additional controllers use their own callback chain and never touch the legacy
@@ -3679,14 +4145,19 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 		uint16_t vid = swap_endianness_16(dd->idVendor);
 		uint16_t pid = swap_endianness_16(dd->idProduct);
 
-		if (vid == MICROSOFT_VENDOR_ID && IsSupportedMicrosoftGamepadPid(pid) &&
+		if (IsSupportedGipGamepad(vid, pid) &&
+			(!IsPowerA1414134(vid, pid) || !g_gipExt.deviceHandle) &&
 			id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
 			id->bInterfaceProtocol == 0xD0 &&
 			id->bInterfaceNumber == 0 &&    // interface 0 = GIP data
 			id->bNumEndpoints == 2) {       // interface 1 (audio) has 0 in alt 0 - skip it
 			XboxInputSetDiagStage(20);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CANDIDATE,
+				((DWORD)vid << 16) | pid);
 
 			g_gipClaimAttempts++;
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CLAIM_BEGIN,
+				g_gipClaimAttempts);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
 				((DWORD)vid << 16) | pid,
 				((DWORD)id->bInterfaceNumber << 8) | id->bNumEndpoints);
@@ -3704,6 +4175,10 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 
 			// Statically allocated rather than new'd: we do not know the IRQL this
 			// callback runs at, and a failed allocation here would be a hang.
+			g_gipVendorId = vid;
+			g_gipProductId = pid;
+			InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
+			InterlockedExchange(&g_powerAIdentifyComplete, 0);
 			memset(&g_gipExt, 0, sizeof(g_gipExt));
 			g_gipExt.deviceHandle = h;
 			g_gipExt.interfaceNumber = id->bInterfaceNumber;
@@ -3777,6 +4252,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 #endif
 			RM_DBG("RIFFMASTER: claim AddDeviceComplete(status=0) returned 0x%08X, driver now=%p\r\n",
 				r, h->driver);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CLAIM_COMPLETE, r);
 
 #ifdef RIFFMASTER_CLAIM_ONLY
 			// L7-claimonly: take the device and stop. No default endpoint, no
@@ -3791,6 +4267,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			return r;
 #endif
 			NTSTATUS s = UsbdOpenDefaultEndpoint(h, (DWORD*)&g_gipExt.controlTrb);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_DEFAULT_ENDPOINT_OPEN, s);
 			// RM_LOG, not RM_DBG: under NO_CLAIM this is the whole question - whether
 			// the core will open an endpoint on a device it considers unowned.
 			RM_LOG("RIFFMASTER: UsbdOpenDefaultEndpoint -> 0x%08X %s\r\n",
@@ -3809,6 +4286,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 				1,      // bConfigurationValue
 				0, 0, nullptr,
 				(DWORD)GipSetConfigComplete);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_SET_CONFIG_QUEUED, q);
 			// NOT an NTSTATUS. This returns a handle-like value (observed 0xE1EBF3C0,
 			// i.e. the device handle) on BOTH the claimed run, where SET_CONFIGURATION
 			// then completed normally, and the unclaimed run, where it never completed.
@@ -3894,6 +4372,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		}
 		if (session) {
 			const uint8_t removedUser = session->userIndex;
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
+				removedUser);
 			session->ready = false;
 			session->guidePending = false;
 			session->outOpen = false;
@@ -3909,6 +4389,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			}
 			if (removedUser != 0xFF)
 				XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_REMOVED, removedUser, 0);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_COMPLETE,
+				removedUser);
 			return 0;
 		}
 	}
@@ -3927,6 +4409,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 	// Stop the read loop FIRST, then release our references.
 	// ---------------------------------------------------------------------
 	if (h && h == g_gipExt.deviceHandle) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
+			g_gipUserIndex);
 		RM_DBG("RIFFMASTER: *** device removed - tearing down GIP state ***\r\n");
 
 		// 0. Stop presenting as a live controller IMMEDIATELY.
@@ -3944,6 +4428,10 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		//    Keep a local copy - the close calls below still need it.
 		deviceHandle* dead = g_gipExt.deviceHandle;
 		g_gipExt.deviceHandle = 0;
+		g_gipVendorId = 0;
+		g_gipProductId = 0;
+		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
+		InterlockedExchange(&g_powerAIdentifyComplete, 0);
 		g_gipOutOpen = false;
 
 		// 2. Do NOT close the endpoints here.
@@ -4073,6 +4561,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		// ===================================================================
 #ifndef RIFFMASTER_REMOVE_CALL_ORIGINAL
 		RM_DBG("RIFFMASTER: skipping kernel removal path\r\n");
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_COMPLETE,
+			removedUser);
 		return 0;
 #endif
 	}
@@ -4539,6 +5029,7 @@ void* NotificationPatchPtr = nullptr;
 void* XamInputGetCapabilitiesPtr = nullptr;   // ordinal 400
 void* XamInputGetStatePtr = nullptr;          // ordinal 401
 void* XamGetCurrentTitleIdPtr = nullptr;      // ordinal 463
+static DWORD g_xboxInputMissingFunctions = 0;
 bool initFunctionPointers() {
 	isDevkit = *(uint32_t*)(0x8010D334) == 0x00000000;
 	HANDLE kernelHandle = GetModuleHandleA("xboxkrnl.exe");
@@ -4549,6 +5040,11 @@ bool initFunctionPointers() {
 	}
 
 	HANDLE xamHandle = GetModuleHandleA("xam.xex");
+	if (!xamHandle) {
+		g_xboxInputMissingFunctions = 0x80000000;
+		DbgPrint("XBOXINPUT: could not get xam.xex handle\r\n");
+		return false;
+	}
 
 	XexGetProcedureAddress(kernelHandle, 759, &UsbdGetDeviceDescriptor);
 	XexGetProcedureAddress(kernelHandle, 744, &UsbdGetEndpointDescriptor);
@@ -4578,6 +5074,34 @@ bool initFunctionPointers() {
 	XexGetProcedureAddress(xamHandle, 463, &XamGetCurrentTitleIdPtr);
 	RM_LOG("RIFFMASTER: XamGetCurrentTitleId (463) %s\r\n",
 		XamGetCurrentTitleIdPtr ? "resolved" : "DID NOT RESOLVE - using fixed subtype");
+
+	// Validate everything that the active controller path will call before any
+	// detour is installed.  The mask is persisted in the init-abort event.
+	DWORD missing = 0;
+	if (!UsbdGetDeviceDescriptor)       missing |= 0x00000001;
+	if (!UsbdGetEndpointDescriptor)     missing |= 0x00000002;
+	if (!UsbdAddDeviceComplete)         missing |= 0x00000004;
+	if (!UsbdOpenDefaultEndpoint)       missing |= 0x00000008;
+	if (!UsbdOpenEndpoint)              missing |= 0x00000010;
+	if (!UsbdQueueAsyncTransfer)        missing |= 0x00000020;
+	if (!UsbdQueueCloseEndpoint)        missing |= 0x00000040;
+	if (!UsbdQueueCloseDefaultEndpoint) missing |= 0x00000080;
+	if (!UsbdRemoveDeviceComplete)      missing |= 0x00000100;
+	if (!XInputdReadStatePtr)           missing |= 0x00000200;
+	if (!XamInputGetCapabilitiesEx)     missing |= 0x00000400;
+	if (!XamInputSetState)              missing |= 0x00000800;
+	if (!XamInputGetCapabilitiesPtr)    missing |= 0x00001000;
+#ifndef RIFFMASTER_NO_NOTIFY_PATCH
+	if (!NotificationPatchPtr)          missing |= 0x00002000;
+#endif
+#ifndef RIFFMASTER_NO_USB_RESET
+	if (!MmFreePhysicalMemory)           missing |= 0x00004000;
+#endif
+	g_xboxInputMissingFunctions = missing;
+	if (missing) {
+		DbgPrint("XBOXINPUT: required export validation failed mask=%08X\r\n", missing);
+		return false;
+	}
 
 	if (isDevkit) {
 		DbgPrint("EINTIM: Running in devkit mode\n");
@@ -4696,24 +5220,50 @@ bool initFunctionPointers() {
 	return true;
 }
 
-BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
-	if (Reason == DLL_PROCESS_ATTACH) {
-		XboxInputLogReset();
+static DWORD XboxInputInitializeThread(PVOID) {
+#ifndef XBOXINPUT_DISABLE_FILE_LOG
+		// This function runs only after DllMain has returned. Start persistence before
+		// configuration, export resolution, patches, or hooks, then briefly give the
+		// logger first access to mounted storage. It continues retrying independently.
+		HANDLE loggerThread = MakeThread((LPTHREAD_START_ROUTINE)XboxInputLogThread, nullptr);
+		if (loggerThread) {
+			CloseHandle(loggerThread);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_LOGGER_STARTED, 0);
+			DWORD waitStart = GetTickCount();
+			while (!g_xboxInputLoggerReady && (DWORD)(GetTickCount() - waitStart) < 2000)
+				Sleep(25);
+		}
+#endif
 		XboxInputSetDiagStage(1);
+#ifdef XBOXINPUT_LOAD_NOTIFY
+		// Diagnostic-only proof that DashLaunch reached this module's entry point.
+		// Keep this before every version gate and subsystem initialization step.
+		XNotifyUI(XNOTIFYUI_TYPE_PREFERRED_REVIEW, L"XboxInput diagnostic build loaded");
+#endif
 		// Fires before ANY check below, so "did our build load at all?" is answerable
 		// even when the version/tray gate aborts the launch. Build stamp distinguishes
 		// this xex from any other hiddriver360 build on the console.
 		RM_LOG("RIFFMASTER: *** RiffMaster GIP driver loaded - built " __DATE__ " " __TIME__ " ***\r\n");
+		BOOL trayOpen = IsTrayOpen();
 		RM_LOG("RIFFMASTER: kernel build %d, tray open = %d\r\n",
-			XboxKrnlVersion->Build, IsTrayOpen() ? 1 : 0);
+			XboxKrnlVersion->Build, trayOpen ? 1 : 0);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ENVIRONMENT,
+			((XboxKrnlVersion->Build & 0xFFFF) << 16) | (trayOpen ? 1 : 0));
 
-		if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
+		if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || trayOpen) {
 			RM_LOG("RIFFMASTER: ABORTING - unsupported kernel build or disc tray open\r\n");
 			DbgPrint("EINTIM: Only 17559 and 17489 dashboards are currently supported or the disk tray is open. Aborting launch...\n");
-			return FALSE;
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ABORT_UNSUPPORTED,
+				((XboxKrnlVersion->Build & 0xFFFF) << 16) | (trayOpen ? 1 : 0));
+			// Stay resident but inert so the logger can explain the safe abort.
+			return TRUE;
 		}
 
 		RM_LOG("RIFFMASTER: *** BUILD LADDER LEVEL %d ***\r\n", RIFFMASTER_LEVEL);
+
+#ifdef XBOXINPUT_RESTORE_WGC_MATCH
+		XboxInputRestoreWgcDescriptorCheck();
+#endif
 
 		// Level 0 is the control: a plugin that loads into the same process, at the
 		// same base address, and then does nothing at all. If a disconnect freezes
@@ -4722,6 +5272,8 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// add subsystems onto — which is the thing the subtractive bisection lacked.
 #if RIFFMASTER_LEVEL == RM_LVL_NULL
 		RM_LOG("RIFFMASTER: level 0 - loaded and doing nothing. Disconnect the dongle now.\r\n");
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_COMPLETE, 0);
+		XboxInputSetDiagStage(12);
 		return TRUE;
 #else
 		// Optional user settings. Missing file is normal and not an error - it means
@@ -4735,10 +5287,17 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 			g_rmCfg.tiltThreshold, g_rmCfg.starPowerTilt, g_rmCfg.starPowerClick,
 			g_rmCfg.soloFlag, g_rmCfg.invertStrum, g_rmCfg.defaultSubType,
 			g_rmCfg.overrideCount);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_CONFIG_LOADED,
+			(cfgFound ? 0x80000000 : 0) | (g_rmCfg.overrideCount & 0xFFFF));
 
 		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
-		if (!initFunctionPointers())
-			return FALSE;
+		if (!initFunctionPointers()) {
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ABORT_FUNCTIONS,
+				g_xboxInputMissingFunctions);
+			// No detours have been installed. Remain loaded only to persist the error.
+			return TRUE;
+		}
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_FUNCTIONS_READY, 0);
 
 		DbgPrint("EINTIM: Loading mappings!\r\n");
 #ifndef RIFFMASTER_GIP_ONLY
@@ -4772,6 +5331,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 #if RIFFMASTER_LEVEL >= RM_LVL_FULL
 		InstallUsbProbes();
 		XboxInputSetDiagStage(10);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_USB_HOOKS_READY, 0);
 #endif
 
 #if RIFFMASTER_LEVEL >= RM_LVL_XAMHOOKS
@@ -4789,6 +5349,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		XamInputGetCapabilitiesDetour.Install();
 		XInputdReadStateDetour.Install();
 		XboxInputSetDiagStage(11);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_XAM_HOOKS_READY, 0);
 		DbgPrint("EINTIM: Hooks installed\n");
 #else
 		RM_LOG("RIFFMASTER: XamInput/XInputd detours SKIPPED (level %d)\r\n", RIFFMASTER_LEVEL);
@@ -4832,10 +5393,11 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 #endif
 #else
 		RM_LOG("RIFFMASTER: USB driver reset SKIPPED - power the guitar on AFTER boot\r\n");
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_USB_RESET_SKIPPED, 0);
 #endif
 
-		MakeThread((LPTHREAD_START_ROUTINE)XboxInputLogThread, nullptr);
 		XboxInputSetDiagStage(12);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_COMPLETE, 0);
 
 		// Start mapping manager thread.
 		// Not needed for the RiffMaster: our mapping is fixed and known, so the JSON
@@ -4845,6 +5407,21 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
 #endif
 #endif // RIFFMASTER_LEVEL == RM_LVL_NULL
+	return 0;
+}
+
+BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
+	UNREFERENCED_PARAMETER(Handle);
+	UNREFERENCED_PARAMETER(Reserved);
+	if (Reason == DLL_PROCESS_ATTACH) {
+		// Keep loader entry minimal. Performing config I/O, export resolution and
+		// detour installation under the module-loader lock can prevent the logger
+		// thread from ever running if an early initialization step faults.
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ENTRY, 0);
+		HANDLE initThread = MakeThread((LPTHREAD_START_ROUTINE)XboxInputInitializeThread, nullptr);
+		if (!initThread)
+			return FALSE;
+		CloseHandle(initThread);
 	}
 	return TRUE;
 }
