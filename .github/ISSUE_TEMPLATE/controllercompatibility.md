@@ -2,13 +2,14 @@
 name: ControllerCompatibility
 about: Submit a request to add a third party controller to this plugin
 title: "[Compatibility]"
-labels: ''
+labels: enhancement
 assignees: bloxmaster0811
 
 ---
 
 Controller
 
+- **Model of Xbox 360 and mod type:**
 - **Manufacturer and exact model:**
 - **Product link or label photo:**
 - **Wired / wireless / Bluetooth / adapter:**
