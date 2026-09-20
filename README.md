@@ -4,7 +4,6 @@
  ![GitHub Repo stars](https://img.shields.io/github/stars/bloxmaster0811/XboxInput?style=flat&logo=github)
 
 
-
 Use wired official Xbox One and Xbox Series controllers as standard Xbox 360
 gamepads on a modded Xbox 360 .
 
@@ -20,8 +19,6 @@ Have a third-party Xbox One/Series Controller and want it supported? Please read
 
 Multiple controllers up to 4 connected are supported! Please report any problems to the issues page!
 
-Tested working with Xbox One S controller and Xbox Series Controller
-
 ## Installation
 Copy to the Hard drive or any other location to be added from within Dashlaunch or installed manually via the launch.ini
 
@@ -34,8 +31,11 @@ Incompatible with Hiddriver 360!
 4. Reboot with the controller disconnected. Once the dashboard is running,
    connect it by USB.
 
+The controller may not turn on by itself! You will need to press the guide button to manually wake the controller
+
 If the controller does not connect straight away unplug and replug the cable.
 
+Tested working with Xbox One S controller and Xbox Series Controller
 ## Building
 See `BUILDING.md`.
 This project requires the Xbox 360 XDK and Visual Studio 2010. 
@@ -44,5 +44,7 @@ This project requires the Xbox 360 XDK and Visual Studio 2010.
 Thanks to EnTim23 who made the Hiddriver360 project and helped provide the backend virtual controller configuration and mapping https://github.com/EinTim23/hiddriver360
 
 Thanks to Durg5 who made the riffmaster-rgh360 project who saved me the headache of figuring out the GIP transport https://github.com/Durg5/riffmaster-rgh360
+
+Thanks to the various authors who wrote the Linux xpad driver which provided useful reference points and implementations of controller functionality. https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c
 ## licensing
 This release is GPL-3.0. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
