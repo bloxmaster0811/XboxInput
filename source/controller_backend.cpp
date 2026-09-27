@@ -9,29 +9,38 @@ static const XboxInputUsbInterfaceIdentity kWiredGipInterface = {
 	0, 0, 2, 0xFF, 0x47, 0xD0
 };
 
-#define WIRED_GIP_PROFILE(pid, label, parserType, extraCaps, extraQuirks) \
+static const XboxInputUsbEndpointIdentity kLegacyWiredGipEndpoints = {
+	0x81, 0x01, 0x03, 4, 64
+};
+
+static const XboxInputUsbEndpointIdentity kModernWiredGipEndpoints = {
+	0x82, 0x02, 0x03, 4, 64
+};
+
+#define WIRED_GIP_PROFILE(pid, label, parserType, extraCaps, extraQuirks, endpoints) \
 	{ 0x045E, pid, 0x0000, 0xFFFF, label, \
 	  XBOXINPUT_TRANSPORT_GIP_WIRED, parserType, \
 	  XBOXINPUT_INIT_GIP_STANDARD, \
 	  kStandardGamepadCapabilities | (extraCaps), \
 	  XBOXINPUT_QUIRK_GUIDE_SEPARATE | XBOXINPUT_QUIRK_IDENTIFY_ACK | (extraQuirks), \
-	  kWiredGipInterface }
+	  kWiredGipInterface, endpoints }
 
 // This is the single source of truth for devices the rejected-device claim
 // path may take.  A FF/47/D0 signature alone is never sufficient.
 static const XboxInputControllerProfile kControllerProfiles[] = {
-	WIRED_GIP_PROFILE(0x02D1, "Xbox One", XBOXINPUT_PARSER_GIP_STANDARD, 0, 0),
+	WIRED_GIP_PROFILE(0x02D1, "Xbox One", XBOXINPUT_PARSER_GIP_STANDARD, 0, 0,
+		kLegacyWiredGipEndpoints),
 	WIRED_GIP_PROFILE(0x02DD, "Xbox One (2015)", XBOXINPUT_PARSER_GIP_STANDARD, 0,
-		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE),
+		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE, kLegacyWiredGipEndpoints),
 	WIRED_GIP_PROFILE(0x02E3, "Xbox One Elite", XBOXINPUT_PARSER_GIP_STANDARD, 0,
-		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE),
+		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE, kLegacyWiredGipEndpoints),
 	WIRED_GIP_PROFILE(0x02EA, "Xbox One S", XBOXINPUT_PARSER_GIP_STANDARD, 0,
-		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE),
+		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE, kModernWiredGipEndpoints),
 	WIRED_GIP_PROFILE(0x0B00, "Xbox Elite Series 2", XBOXINPUT_PARSER_GIP_STANDARD, 0,
-		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE),
+		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE, kModernWiredGipEndpoints),
 	WIRED_GIP_PROFILE(0x0B12, "Xbox Series X|S", XBOXINPUT_PARSER_GIP_STANDARD,
 		0,
-		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE),
+		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE, kModernWiredGipEndpoints),
 	{
 		0x24C6, 0x543A, 0x0000, 0xFFFF,
 		"PowerA Xbox One Wired (1414134-01)",
@@ -43,7 +52,8 @@ static const XboxInputControllerProfile kControllerProfiles[] = {
 		XBOXINPUT_QUIRK_IDENTIFY_ACK |
 		XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE |
 		XBOXINPUT_QUIRK_POWERA_RUMBLE_KICK,
-		{ 0, 0, 2, 0xFF, 0x47, 0xD0 }
+		{ 0, 0, 2, 0xFF, 0x47, 0xD0 },
+		{ 0x82, 0x02, 0x03, 4, 64 }
 	},
 };
 

@@ -59,6 +59,19 @@ struct XboxInputUsbInterfaceIdentity {
 	uint8_t interfaceProtocol;
 };
 
+// The Xbox 360 USB descriptor helper does not reliably expose endpoint
+// descriptors for devices claimed through the rejected-device path.  Endpoint
+// topology is therefore part of the trusted built-in profile rather than a
+// transport-wide fallback.  Early Xbox One controllers use EP1 while newer
+// Xbox One S/Series controllers use EP2.
+struct XboxInputUsbEndpointIdentity {
+	uint8_t inputAddress;
+	uint8_t outputAddress;
+	uint8_t transferType;
+	uint8_t interval;
+	uint16_t maximumPacketSize;
+};
+
 struct XboxInputControllerProfile {
 	uint16_t vendorId;
 	uint16_t productId;
@@ -71,6 +84,7 @@ struct XboxInputControllerProfile {
 	uint32_t capabilities;
 	uint32_t quirks;
 	XboxInputUsbInterfaceIdentity interfaceIdentity;
+	XboxInputUsbEndpointIdentity endpointIdentity;
 };
 
 enum XboxInputProfileMatchResult {

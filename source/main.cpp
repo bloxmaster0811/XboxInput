@@ -4100,55 +4100,23 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		return status;
 	}
 
-	// Prefer the descriptor. It returned NULL on hardware for this device - the lookup
-	// appears to depend on interface state our non-standard claim path never established -
-	// so sweep every (type, direction, index) first and report what, if anything, it knows.
-	usb_endpoint_descriptor* ep = 0;
-	for (int xfer = 0; xfer <= 3 && !ep; xfer++) {
-		for (int dir = 0; dir <= 1 && !ep; dir++) {
-			for (int idx = 0; idx < 2; idx++) {
-				usb_endpoint_descriptor* e =
-					UsbdGetEndpointDescriptor(ext->deviceHandle, idx, xfer, dir);
-				if (!e || e->bLength != 7 || e->bDescriptorType != 5)
-					continue;
-				RM_DBG("RIFFMASTER: descriptor sweep found EP %02X attr=%02X [q:%d/%d/%d]\r\n",
-					e->bEndpointAddress, e->bmAttributes, xfer, dir, idx);
-				// We want the interrupt IN endpoint specifically.
-				if ((e->bEndpointAddress & 0x80) && (e->bmAttributes & 3) == USB_ENDPOINT_TYPE_INTERRUPT) {
-					ep = e;
-					break;
-				}
-			}
-		}
+	// Descriptor lookup is unreliable for devices claimed through this rejected-device
+	// path.  The old fallback assumed every GIP controller used the Xbox One S endpoint
+	// pair (82/02), which opened nonexistent endpoints on 02D1/02DD controllers.  The
+	// refactored profile is the trusted source of endpoint topology for known devices.
+	const XboxInputControllerProfile* activeProfile = g_gipRuntime.profile;
+	if (!activeProfile) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 59, 0xFFFFFFFF);
+		return -1;
 	}
-
-	BYTE     epAddr;
-	uint16_t pkt;
-	BYTE     interval;
-
-	if (ep) {
-		epAddr   = ep->bEndpointAddress;
-		pkt      = swap_endianness_16(ep->wMaxPacketSize) & 0x7FF;
-		interval = ep->bInterval;
-		RM_DBG("RIFFMASTER: using descriptor values\r\n");
-	}
-	else {
-		// Fall back to the values captured from this exact device on PC and confirmed
-		// twice: Wireshark's dissected fields, and the raw configuration descriptor
-		// bytes in docs/riffmaster_descriptors.bin. See docs/gip_riffmaster.md section 2.
-		// This is a verified constant, not a guess - but it IS device-specific, which is
-		// acceptable because we only claim this one VID/PID.
-		// The Xbox One S controller observed on the target console exposes IN on
-		// 0x82 (OUT is 0x02), not the RiffMaster guitar's 0x81 endpoint.
-		epAddr   = 0x82;
-		pkt      = 64;
-		interval = 4;
-		RM_DBG("RIFFMASTER: descriptor lookup failed - using VERIFIED capture values\r\n");
-	}
+	const XboxInputUsbEndpointIdentity* endpoints = &activeProfile->endpointIdentity;
+	BYTE epAddr = endpoints->inputAddress;
+	uint16_t pkt = endpoints->maximumPacketSize;
+	BYTE interval = endpoints->interval;
 
 	RM_DBG("RIFFMASTER: opening EP %02X maxPacket=%d interval=%d\r\n", epAddr, pkt, interval);
 
-	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
+	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, endpoints->transferType,
 		epAddr, pkt, interval, (DWORD*)&ext->interruptTrb);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_INTERRUPT_IN_OPEN,
 		((DWORD)epAddr << 24) | ((DWORD)pkt << 8) | (NT_ERROR(s) ? 0x80 : interval));
@@ -4160,20 +4128,13 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	RM_LOG("RIFFMASTER: *** interrupt IN endpoint OPEN - starting GIP reads ***\r\n");
 	XboxInputSetDiagStage(60);
 
-	// Open the interrupt OUT endpoint too - without it we can never answer ANNOUNCE.
-	// EP 0x02 OUT, INTERRUPT, 64, bInterval 4 (docs/gip_riffmaster.md section 2).
+	// Open the matching profile-owned OUT endpoint too - without it we can never
+	// answer ANNOUNCE. Early Xbox One controllers use EP1; newer pads use EP2.
 	{
-		BYTE     outAddr = 0x02;
-		uint16_t outPkt = 64;
-		BYTE     outInterval = 4;
-		usb_endpoint_descriptor* oe = UsbdGetEndpointDescriptor(
-			ext->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
-		if (oe && oe->bLength == 7 && oe->bDescriptorType == 5) {
-			outAddr = oe->bEndpointAddress;
-			outPkt = swap_endianness_16(oe->wMaxPacketSize) & 0x7FF;
-			outInterval = oe->bInterval;
-		}
-		NTSTATUS os = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
+		BYTE outAddr = endpoints->outputAddress;
+		uint16_t outPkt = endpoints->maximumPacketSize;
+		BYTE outInterval = endpoints->interval;
+		NTSTATUS os = UsbdOpenEndpoint(ext->deviceHandle, endpoints->transferType,
 			outAddr, outPkt, outInterval, (DWORD*)&g_gipOutTrb);
 		g_gipOutOpen = !NT_ERROR(os);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_INTERRUPT_OUT_OPEN,
@@ -4199,7 +4160,8 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	RM_LOG("RIFFMASTER: interrupt reads NOT started (noread variant)\r\n");
 	return 0;
 #endif
-	if (g_gipOutOpen && g_gipVendorId == MICROSOFT_VENDOR_ID &&
+	if (g_gipOutOpen &&
+		(activeProfile->quirks & XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE) != 0 &&
 		InterlockedCompareExchange(&g_gipEarlyPowerBusy, 1, 0) == 0) {
 		g_gipEarlyPowerHandle = ext->deviceHandle;
 		g_gipEarlyPowerPacketSize = pkt;
@@ -4281,15 +4243,23 @@ static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
 	GipSessionSlot* session = GipSessionFromExtension(ext);
 	if (!session || !session->reserved || status != 0 || !ext->deviceHandle)
 		return status;
-	NTSTATUS inStatus = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
-		0x82, 64, 4, (DWORD*)&ext->interruptTrb);
+	const XboxInputControllerProfile* profile = session->runtime.profile;
+	if (!profile)
+		return -1;
+	const XboxInputUsbEndpointIdentity* endpoints = &profile->endpointIdentity;
+	NTSTATUS inStatus = UsbdOpenEndpoint(ext->deviceHandle, endpoints->transferType,
+		endpoints->inputAddress, endpoints->maximumPacketSize, endpoints->interval,
+		(DWORD*)&ext->interruptTrb);
 	if (NT_ERROR(inStatus))
 		return inStatus;
-	NTSTATUS outStatus = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
-		0x02, 64, 4, (DWORD*)&session->outTrb);
+	NTSTATUS outStatus = UsbdOpenEndpoint(ext->deviceHandle, endpoints->transferType,
+		endpoints->outputAddress, endpoints->maximumPacketSize, endpoints->interval,
+		(DWORD*)&session->outTrb);
 	session->outOpen = !NT_ERROR(outStatus);
 	if (!session->outOpen)
 		return outStatus;
+	if ((profile->quirks & XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE) == 0)
+		return GipSessionStartRead(session);
 	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
 	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
 	session->outTrb.buffer = session->earlyPowerBuf;
@@ -5083,12 +5053,13 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration)
 		user = 0;
 	GipControllerRef controller;
 	if (GipControllerFromUser((uint8_t)user, &controller)) {
+		const XboxInputMappingOptions* mapping = XboxInputGetActiveMapping();
 		const BYTE left = XboxInputScaleRumble(
 			vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0,
-			g_xboxInputGamepadMapping.rumblePercent);
+			mapping->rumblePercent);
 		const BYTE right = XboxInputScaleRumble(
 			vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0,
-			g_xboxInputGamepadMapping.rumblePercent);
+			mapping->rumblePercent);
 		GipControllerSendRumble(&controller, left, right);
 		return ERROR_SUCCESS;
 	}
@@ -5214,10 +5185,26 @@ static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 	DWORD notificationStarted = 0;
 	LONG pendingRemoved = 0;
 	BOOL savedShow = TRUE, savedMovie = TRUE, savedSound = TRUE, savedIptv = TRUE;
+	DWORD lastMappingReloadCheck = 0;
 	for (;;) {
 		if (!XamGetCurrentTitleIdPtr ||
 			((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)() != workerTitle)
 			break;
+
+		const DWORD now = GetTickCount();
+		if ((DWORD)(now - lastMappingReloadCheck) >= 500) {
+			lastMappingReloadCheck = now;
+			FILE* request = fopen(RM_CFG_RELOAD_PATH, "r");
+			if (request) {
+				fclose(request);
+				XboxInputMappingOptions reloaded;
+				if (RmCfgLoadGamepadMapping(RM_CFG_PATH, &reloaded)) {
+					XboxInputPublishMapping(&reloaded);
+					RM_LOG("XBOXINPUT: mapping reloaded on request\r\n");
+				}
+				remove(RM_CFG_RELOAD_PATH);
+			}
+		}
 
 		pendingRemoved |= InterlockedExchange(&g_xboxInputRemovedUiMask, 0);
 		if (pendingRemoved && !notificationActive && g_xboxInputDisconnectedUiMask != 0) {
