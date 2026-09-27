@@ -97,12 +97,14 @@
     <ClInclude Include="gip_auth.h" />
     <ClInclude Include="riffmaster_config.h" />
     <ClInclude Include="riffmaster_build.h" />
+    <ClInclude Include="controller_backend.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="hid_parser.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Detours.cpp" />
     <ClCompile Include="mapping.cpp" />
+    <ClCompile Include="controller_backend.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />

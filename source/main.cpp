@@ -155,6 +155,10 @@ enum XboxInputUsbStep {
 	XBOXINPUT_USB_XAM_REGISTER,
 	XBOXINPUT_USB_REMOVE_BEGIN,
 	XBOXINPUT_USB_REMOVE_COMPLETE,
+	XBOXINPUT_USB_EARLY_POWER_QUEUED,
+	XBOXINPUT_USB_EARLY_POWER_COMPLETE,
+	XBOXINPUT_USB_RESUMED_FROM_INPUT,
+	XBOXINPUT_USB_READ_LOOP_STOPPED,
 	XBOXINPUT_USB_POWERA_STAGE = 100,
 };
 struct XboxInputLogEvent {
@@ -243,6 +247,10 @@ static const char* XboxInputUsbStepName(DWORD step) {
 	case XBOXINPUT_USB_XAM_REGISTER: return "xam_registered";
 	case XBOXINPUT_USB_REMOVE_BEGIN: return "remove_begin";
 	case XBOXINPUT_USB_REMOVE_COMPLETE: return "remove_complete";
+	case XBOXINPUT_USB_EARLY_POWER_QUEUED: return "early_power_queued";
+	case XBOXINPUT_USB_EARLY_POWER_COMPLETE: return "early_power_complete";
+	case XBOXINPUT_USB_RESUMED_FROM_INPUT: return "resumed_from_valid_input";
+	case XBOXINPUT_USB_READ_LOOP_STOPPED: return "read_loop_stopped";
 	default: return step >= XBOXINPUT_USB_POWERA_STAGE ? "powera_init_stage" : "unknown";
 	}
 }
@@ -2061,32 +2069,26 @@ static bool IsPowerA1414134(uint16_t vid, uint16_t pid) {
 }
 
 static const char* XboxInputKnownControllerName(uint16_t vid, uint16_t pid) {
-	if (IsPowerA1414134(vid, pid))
-		return "PowerA Xbox One Wired (1414134-01)";
-	if (vid != MICROSOFT_VENDOR_ID)
-		return "Unknown";
-	switch (pid) {
-	case 0x02D1: return "Xbox One";
-	case 0x02DD: return "Xbox One (2015)";
-	case 0x02E3: return "Xbox One Elite";
-	case 0x02EA: return "Xbox One S";
-	case 0x0B00: return "Xbox Elite Series 2";
-	case 0x0B12: return "Xbox Series X|S";
-	default: return "Unknown";
-	}
+	const XboxInputControllerProfile* profile =
+		XboxInputFindProfileById(vid, pid, 0);
+	return profile ? profile->name : "Unknown";
 }
 static bool IsSupportedMicrosoftGamepadPid(uint16_t pid) {
-	switch (pid) {
-	case 0x02D1: // Xbox One
-	case 0x02DD: // Xbox One (2015 firmware)
-	case 0x02E3: // Xbox One Elite
-	case 0x02EA: // Xbox One S
-	case 0x0B00: // Xbox One Elite Series 2
-	case 0x0B12: // Xbox Series S|X (wired)
-		return true;
-	default:
-		return false;
-	}
+	return XboxInputFindProfileById(MICROSOFT_VENDOR_ID, pid, 0) != 0;
+}
+
+static XboxInputUsbInterfaceIdentity XboxInputInterfaceIdentity(
+	const usb_interface_descriptor* descriptor) {
+	XboxInputUsbInterfaceIdentity identity = { 0 };
+	if (!descriptor)
+		return identity;
+	identity.number = descriptor->bInterfaceNumber;
+	identity.alternateSetting = descriptor->bAlternateSetting;
+	identity.endpointCount = descriptor->bNumEndpoints;
+	identity.interfaceClass = descriptor->bInterfaceClass;
+	identity.interfaceSubClass = descriptor->bInterfaceSubClass;
+	identity.interfaceProtocol = descriptor->bInterfaceProtocol;
+	return identity;
 }
 
 // Budget of claim attempts, NOT reset by teardown - only by a connection that reaches
@@ -2114,6 +2116,7 @@ static int g_gipClaimAttempts = 0;
 static HidControllerExtension g_gipExt;
 static uint16_t g_gipVendorId = 0;
 static uint16_t g_gipProductId = 0;
+static const XboxInputControllerProfile* g_gipProfile = 0;
 
 // Read buffer for the GIP interrupt IN endpoint. wMaxPacketSize is 64
 // (docs/gip_riffmaster.md section 2, read from the descriptor, not assumed).
@@ -2140,6 +2143,13 @@ static UsbTrb  g_gipOutTrb;
 static BYTE    g_gipOutBuf[GIP_TX_BUFS][64];
 static int     g_gipOutBufIdx = 0;
 static bool    g_gipOutOpen = false;
+// Official pads may wait for host POWER before their first ANNOUNCE. Keep this
+// transfer serialized ahead of the first IN read so the shared OUT TRB cannot
+// be reused by IDENTIFY while POWER is still owned by the USB stack.
+static BYTE    g_gipEarlyPowerBuf[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
+static volatile LONG g_gipEarlyPowerBusy = 0;
+static deviceHandle* g_gipEarlyPowerHandle = 0;
+static uint16_t g_gipEarlyPowerPacketSize = GIP_READ_BUF_SIZE;
 // Rumble is called by XAM far more frequently than actual motor state changes.
 // UsbdQueueAsyncTransfer is asynchronous, so reusing g_gipOutTrb for each call
 // while the USB core still owns it corrupts the transfer list.  Keep exactly one
@@ -2211,8 +2221,10 @@ static bool     g_gipHostFinishReady = false;
 #define GIP_MAX_ADDITIONAL_ACTIVE 3
 struct GipSessionSlot {
 	bool                    reserved;
+	const XboxInputControllerProfile* profile;
 	HidControllerExtension  ext;
 	UsbTrb                  outTrb;
+	BYTE                    earlyPowerBuf[5];
 	BYTE                    readBuf[GIP_READ_BUF_SIZE];
 	BYTE                    outBuf[GIP_TX_BUFS][64];
 	BYTE                    rumbleBuf[64];
@@ -2296,8 +2308,7 @@ static uint8_t GipNextSeq() {
 }
 
 static bool IsSupportedGipGamepad(uint16_t vid, uint16_t pid) {
-	return (vid == MICROSOFT_VENDOR_ID && IsSupportedMicrosoftGamepadPid(pid)) ||
-		IsPowerA1414134(vid, pid);
+	return XboxInputFindProfileById(vid, pid, 0) != 0;
 }
 
 static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor);
@@ -3621,6 +3632,19 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 		case GIP_CMD_INPUT:
 			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &g_gipState)) {
+				// A controller can retain its GIP session across a quick USB bounce.
+				// In that case it resumes streaming INPUT without a new ANNOUNCE or
+				// IDENTIFY. A valid parsed report on our claimed, supported interface
+				// is enough to restore the XAM slot; otherwise input is lost at user 255.
+				if (!g_gipReady && g_gipExt.deviceHandle &&
+					IsSupportedGipGamepad(g_gipVendorId, g_gipProductId)) {
+					g_gipReady = true;
+					g_gipPoweredOn = true;
+					g_gipClaimAttempts = 0;
+					XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+						XBOXINPUT_USB_RESUMED_FROM_INPUT, hdr.sequence);
+					GipRegisterWithXam();
+				}
 				if (g_gipInputsSeen == 0)
 					XboxInputQueueLogEvent(XBOXINPUT_LOG_FIRST_INPUT,
 						g_gipUserIndex == 0xFF ? 0xFF : g_gipUserIndex, hdr.sequence);
@@ -3717,8 +3741,15 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 			}
 			break;
 		case GIP_CMD_INPUT:
-			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &session->state))
+			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &session->state)) {
+				if (!session->ready && session->ext.deviceHandle) {
+					session->poweredOn = true;
+					XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+						XBOXINPUT_USB_RESUMED_FROM_INPUT, hdr.sequence);
+					GipSessionRegisterWithXam(session);
+				}
 				session->inputsSeen++;
+			}
 			break;
 		}
 		off += total;
@@ -3788,6 +3819,8 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 		GipHandleTransfer(g_gipReadBuf, (int)ext->interruptTrb.length);
 	}
 	else if (++g_gipReadErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_READ_LOOP_STOPPED, status);
 		// Stop permanently. Nulling the handle is what every other path already
 		// treats as "this device is finished", so teardown stays unchanged.
 		ext->deviceHandle = 0;
@@ -3831,6 +3864,42 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 		g_gipReadLoopStopped = true;
 	}
 	return queued;
+}
+
+static int32_t GipStartPrimaryRead(HidControllerExtension* ext, uint16_t packetSize) {
+	if (!ext || !ext->deviceHandle)
+		return -1;
+#ifdef RIFFMASTER_NO_READ
+	UNREFERENCED_PARAMETER(packetSize);
+	return 0;
+#else
+	if (packetSize > GIP_READ_BUF_SIZE)
+		packetSize = GIP_READ_BUF_SIZE;
+	memset(g_gipReadBuf, 0, sizeof(g_gipReadBuf));
+	ext->interruptTrb.savedEndpoint = ext->interruptTrb.endpoint;
+	ext->interruptTrb.length = packetSize;
+	ext->interruptTrb.buffer = g_gipReadBuf;
+	ext->interruptTrb.callback = (DWORD)GipInterruptComplete;
+	ext->interruptTrb.flags = 1;
+	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, queued);
+	return queued;
+#endif
+}
+
+static int32_t GipEarlyPowerComplete(DWORD trbAddr, int32_t status) {
+	if (trbAddr != (DWORD)&g_gipOutTrb)
+		return status;
+	deviceHandle* poweredHandle = g_gipEarlyPowerHandle;
+	uint16_t packetSize = g_gipEarlyPowerPacketSize;
+	g_gipEarlyPowerHandle = 0;
+	InterlockedExchange(&g_gipEarlyPowerBusy, 0);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_EARLY_POWER_COMPLETE, status);
+	// A disconnect may have occurred while this asynchronous transfer was in
+	// flight. Never start a read on a new claim from an old completion.
+	if (poweredHandle && g_gipExt.deviceHandle == poweredHandle)
+		return GipStartPrimaryRead(&g_gipExt, packetSize);
+	return status;
 }
 
 //
@@ -3937,9 +4006,6 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		}
 	}
 
-	if (pkt > GIP_READ_BUF_SIZE)
-		pkt = GIP_READ_BUF_SIZE;
-
 #ifdef RIFFMASTER_NO_READ
 	// L7-noread: claim the device and open all three endpoints exactly as normal, then
 	// never queue a single interrupt read. Nothing ever completes, so GipInterruptComplete
@@ -3951,15 +4017,24 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	RM_LOG("RIFFMASTER: interrupt reads NOT started (noread variant)\r\n");
 	return 0;
 #endif
-	memset(g_gipReadBuf, 0, sizeof(g_gipReadBuf));
-	ext->interruptTrb.savedEndpoint = ext->interruptTrb.endpoint;
-	ext->interruptTrb.length = pkt;
-	ext->interruptTrb.buffer = g_gipReadBuf;
-	ext->interruptTrb.callback = (DWORD)GipInterruptComplete;
-	ext->interruptTrb.flags = 1;
-	int32_t readQueued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
-	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, readQueued);
-	return readQueued;
+	if (g_gipOutOpen && g_gipVendorId == MICROSOFT_VENDOR_ID &&
+		InterlockedCompareExchange(&g_gipEarlyPowerBusy, 1, 0) == 0) {
+		g_gipEarlyPowerHandle = ext->deviceHandle;
+		g_gipEarlyPowerPacketSize = pkt;
+		g_gipOutTrb.buffer = g_gipEarlyPowerBuf;
+		g_gipOutTrb.length = sizeof(g_gipEarlyPowerBuf);
+		g_gipOutTrb.flags = 1;
+		g_gipOutTrb.callback = (DWORD)GipEarlyPowerComplete;
+		g_gipOutTrb.savedEndpoint = g_gipOutTrb.endpoint;
+		int32_t queueToken = UsbdQueueAsyncTransfer(ext->deviceHandle, &g_gipOutTrb);
+		// This API returns an opaque transfer token (009B121D on the tested
+		// console), NOT a zero/nonzero status. Only the completion callback says
+		// whether POWER succeeded; it alone may start the first IN read.
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_EARLY_POWER_QUEUED, queueToken);
+		return 0;
+	}
+	return GipStartPrimaryRead(ext, pkt);
 }
 
 // Additional controllers use their own callback chain and never touch the legacy
@@ -3974,6 +4049,8 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 		GipSessionHandleTransfer(session, session->readBuf, (int)ext->interruptTrb.length);
 	}
 	else if (++session->readErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_READ_LOOP_STOPPED, status);
 		ext->deviceHandle = 0;
 		session->readLoopStopped = true;
 		return status;
@@ -3986,6 +4063,34 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	ext->interruptTrb.buffer = session->readBuf;
 	ext->interruptTrb.callback = (DWORD)GipSessionInterruptComplete;
 	return UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+}
+
+static int32_t GipSessionStartRead(GipSessionSlot* session) {
+	if (!session || !session->reserved || !session->ext.deviceHandle)
+		return -1;
+	HidControllerExtension* ext = &session->ext;
+	memset(session->readBuf, 0, sizeof(session->readBuf));
+	ext->interruptTrb.savedEndpoint = ext->interruptTrb.endpoint;
+	ext->interruptTrb.length = GIP_READ_BUF_SIZE;
+	ext->interruptTrb.buffer = session->readBuf;
+	ext->interruptTrb.callback = (DWORD)GipSessionInterruptComplete;
+	ext->interruptTrb.flags = 1;
+	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, queued);
+	return queued;
+}
+
+static int32_t GipSessionEarlyPowerComplete(DWORD trbAddr, int32_t status) {
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		GipSessionSlot* session = &g_gipSessions[i];
+		if ((DWORD)&session->outTrb != trbAddr)
+			continue;
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_EARLY_POWER_COMPLETE, status);
+		return session->reserved && session->ext.deviceHandle
+			? GipSessionStartRead(session) : status;
+	}
+	return status;
 }
 
 static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
@@ -4002,21 +4107,27 @@ static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
 	session->outOpen = !NT_ERROR(outStatus);
 	if (!session->outOpen)
 		return outStatus;
-	memset(session->readBuf, 0, sizeof(session->readBuf));
-	ext->interruptTrb.savedEndpoint = ext->interruptTrb.endpoint;
-	ext->interruptTrb.length = GIP_READ_BUF_SIZE;
-	ext->interruptTrb.buffer = session->readBuf;
-	ext->interruptTrb.callback = (DWORD)GipSessionInterruptComplete;
-	ext->interruptTrb.flags = 1;
-	return UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
+	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
+	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
+	session->outTrb.buffer = session->earlyPowerBuf;
+	session->outTrb.length = sizeof(session->earlyPowerBuf);
+	session->outTrb.flags = 1;
+	session->outTrb.callback = (DWORD)GipSessionEarlyPowerComplete;
+	session->outTrb.savedEndpoint = session->outTrb.endpoint;
+	int32_t queueToken = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+		XBOXINPUT_USB_EARLY_POWER_QUEUED, queueToken);
+	return 0; // The completion callback starts the read, as on the primary path.
 }
 
-static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber) {
+static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
+	const XboxInputControllerProfile* profile) {
 	GipSessionSlot* session = GipFindFreeSession();
-	if (!session)
+	if (!session || !profile)
 		return -1;
 	memset(session, 0, sizeof(*session));
 	session->reserved = true;
+	session->profile = profile;
 	session->userIndex = 0xFF;
 	session->sequence = 1;
 	session->ext.deviceHandle = h;
@@ -4100,18 +4211,23 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	// Once the proven primary path already owns one modern gamepad, every later
 	// matching controller gets a distinct fixed session instead of overwriting the
 	// primary extension and its asynchronous USB transfers.
-	if (status != 0 && h && dd && id && g_gipExt.deviceHandle &&
-		swap_endianness_16(dd->idVendor) == MICROSOFT_VENDOR_ID &&
-		IsSupportedMicrosoftGamepadPid(swap_endianness_16(dd->idProduct)) &&
-		id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
-		id->bInterfaceProtocol == 0xD0 && id->bInterfaceNumber == 0 &&
-		id->bNumEndpoints == 2 &&
+	const uint16_t detectedVid = dd ? swap_endianness_16(dd->idVendor) : 0;
+	const uint16_t detectedPid = dd ? swap_endianness_16(dd->idProduct) : 0;
+	const uint16_t detectedRevision = dd ? swap_endianness_16(dd->bcdDevice) : 0;
+	const XboxInputUsbInterfaceIdentity detectedInterface =
+		XboxInputInterfaceIdentity(id);
+	const XboxInputControllerProfile* detectedProfile = (dd && id)
+		? XboxInputMatchProfile(detectedVid, detectedPid, detectedRevision,
+			&detectedInterface)
+		: 0;
+
+	if (status != 0 && h && g_gipExt.deviceHandle && detectedProfile &&
+		detectedVid == MICROSOFT_VENDOR_ID &&
 		GipActiveSessionCount() < GIP_MAX_ADDITIONAL_ACTIVE && GipFindFreeSession()) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
-			((DWORD)swap_endianness_16(dd->idVendor) << 16) |
-			swap_endianness_16(dd->idProduct),
+			((DWORD)detectedVid << 16) | detectedPid,
 			((DWORD)id->bInterfaceNumber << 8) | id->bNumEndpoints);
-		return GipClaimAdditionalSession(h, id->bInterfaceNumber);
+		return GipClaimAdditionalSession(h, id->bInterfaceNumber, detectedProfile);
 	}
 
 	// ---------------------------------------------------------------------
@@ -4142,15 +4258,12 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 		return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
 #endif
 	if (status != 0 && dd && id && h && g_gipClaimAttempts < GIP_CLAIM_MAX_ATTEMPTS) {
-		uint16_t vid = swap_endianness_16(dd->idVendor);
-		uint16_t pid = swap_endianness_16(dd->idProduct);
+		uint16_t vid = detectedVid;
+		uint16_t pid = detectedPid;
+		const XboxInputControllerProfile* profile = detectedProfile;
 
-		if (IsSupportedGipGamepad(vid, pid) &&
-			(!IsPowerA1414134(vid, pid) || !g_gipExt.deviceHandle) &&
-			id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
-			id->bInterfaceProtocol == 0xD0 &&
-			id->bInterfaceNumber == 0 &&    // interface 0 = GIP data
-			id->bNumEndpoints == 2) {       // interface 1 (audio) has 0 in alt 0 - skip it
+		if (profile &&
+			(!IsPowerA1414134(vid, pid) || !g_gipExt.deviceHandle)) {
 			XboxInputSetDiagStage(20);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CANDIDATE,
 				((DWORD)vid << 16) | pid);
@@ -4177,6 +4290,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// callback runs at, and a failed allocation here would be a hang.
 			g_gipVendorId = vid;
 			g_gipProductId = pid;
+			g_gipProfile = profile;
 			InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 			InterlockedExchange(&g_powerAIdentifyComplete, 0);
 			memset(&g_gipExt, 0, sizeof(g_gipExt));
@@ -4430,6 +4544,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		g_gipExt.deviceHandle = 0;
 		g_gipVendorId = 0;
 		g_gipProductId = 0;
+		g_gipProfile = 0;
 		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 		InterlockedExchange(&g_powerAIdentifyComplete, 0);
 		g_gipOutOpen = false;
@@ -5223,15 +5338,12 @@ bool initFunctionPointers() {
 static DWORD XboxInputInitializeThread(PVOID) {
 #ifndef XBOXINPUT_DISABLE_FILE_LOG
 		// This function runs only after DllMain has returned. Start persistence before
-		// configuration, export resolution, patches, or hooks, then briefly give the
-		// logger first access to mounted storage. It continues retrying independently.
+		// configuration, export resolution, patches, or hooks. Do not wait for
+		// storage here: boot enumeration can finish during even a short delay.
 		HANDLE loggerThread = MakeThread((LPTHREAD_START_ROUTINE)XboxInputLogThread, nullptr);
 		if (loggerThread) {
 			CloseHandle(loggerThread);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_LOGGER_STARTED, 0);
-			DWORD waitStart = GetTickCount();
-			while (!g_xboxInputLoggerReady && (DWORD)(GetTickCount() - waitStart) < 2000)
-				Sleep(25);
 		}
 #endif
 		XboxInputSetDiagStage(1);

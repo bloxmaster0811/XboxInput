@@ -19,6 +19,7 @@
 
 #include <xtl.h>
 #include "riffmaster_config.h"
+#include "controller_backend.h"
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
@@ -314,12 +315,7 @@ static void RiffmasterToXInput(const RiffmasterState* s, XINPUT_GAMEPAD* g) {
 // Standard Xbox One / Series wired-gamepad input (GIP command 0x20).  GIP
 // fields are little-endian on the wire; assemble them bytewise for the 360's
 // big-endian PPC target.
-struct GipGamepadState {
-	WORD buttons;
-	BYTE leftTrigger, rightTrigger;
-	SHORT leftX, leftY, rightX, rightY;
-	bool guide;
-};
+typedef XboxInputNormalizedState GipGamepadState;
 
 static WORD GipReadLe16(const BYTE* p) {
 	return (WORD)(p[0] | ((WORD)p[1] << 8));
