@@ -1,7 +1,8 @@
 # XboxInput  — Use Xbox One/Series Controllers on your modded Xbox 360!
 ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/bloxmaster0811/XboxInput/total?logo=github&link=github.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F)
  ![GitHub Release](https://img.shields.io/github/v/release/bloxmaster0811/XboxInput?style=flat&logo=github&link=https%3A%2F%2Fgithub.com%2Fbloxmaster0811%2FXboxInput%2Freleases%2F)
- ![GitHub Repo stars](https://img.shields.io/github/stars/bloxmaster0811/XboxInput?style=flat&logo=github)
+ ![GitHub Repo stars](https://img.shields.io/github/stars/bloxmaster0811/XboxInput?style=flat&logo=github) [!["Buy Me A Coffee"](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg)](https://www.buymeacoffee.com/bloxmaster0811)
+ 
 
 
 Use wired official Xbox One and Xbox Series controllers as standard Xbox 360
@@ -11,8 +12,6 @@ Controllers compatible with this includes Xbox One, One S, Elite, Elite Series
 2, and Series X|S wired controllers.
 
 Full Xbox 360 Controller functionality with rumble.
-Controllers with more buttons than the original do not have any mappings for the extra buttons nor can they be mapped.
-Long press on the guide button is not supported.
 
 Have a third-party Xbox One/Series Controller and want it supported? Please read the guide and make an issue using the template!
 [Third-party Support Guide](https://github.com/bloxmaster0811/XboxInput/blob/main/THIRD_PARTY_CONTROLLER_SUPPORT.md)
@@ -35,7 +34,9 @@ The controller may not turn on by itself! You will need to press the guide butto
 
 If the controller does not connect straight away unplug and replug the cable.
 
-Tested working with Xbox One S controller and Xbox Series Controller
+If you're still having problems, check if there are any firmware updates available for your controller. You can use the Xbox Accessories app on PC or Xbox to do so.
+
+Tested working with Xbox One S controller and Xbox Series Controller on an RGH 3 Console
 ## Building
 See `BUILDING.md`.
 This project requires the Xbox 360 XDK and Visual Studio 2010. 
