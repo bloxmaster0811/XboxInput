@@ -111,24 +111,6 @@ struct XboxInputControllerRuntime {
 	bool stopping;
 };
 
-// Mapping is intentionally data-only.  Low-level USB/GIP commands are never
-// configurable.  Live application is introduced only after parser parity tests.
-#define XBOXINPUT_MAPPING_BUTTON_COUNT 14
-struct XboxInputMappingOptions {
-	WORD buttonTargets[XBOXINPUT_MAPPING_BUTTON_COUNT];
-	bool invertLeftX;
-	bool invertLeftY;
-	bool invertRightX;
-	bool invertRightY;
-	bool swapSticks;
-	bool swapTriggers;
-	uint16_t leftStickDeadzone;
-	uint16_t rightStickDeadzone;
-	BYTE leftTriggerDeadzone;
-	BYTE rightTriggerDeadzone;
-	BYTE rumblePercent;
-};
-
 const XboxInputControllerProfile* XboxInputFindProfileById(
 	uint16_t vendorId, uint16_t productId, uint16_t revision);
 
@@ -143,7 +125,6 @@ const char* XboxInputTransportName(XboxInputTransportType transport);
 const char* XboxInputInitProfileName(XboxInputInitProfile initProfile);
 
 void XboxInputResetNormalizedState(XboxInputNormalizedState* state);
-void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping);
 void XboxInputInitializeRuntime(XboxInputControllerRuntime* runtime,
 	const XboxInputControllerProfile* profile);
 bool XboxInputRuntimeIsReady(const XboxInputControllerRuntime* runtime);

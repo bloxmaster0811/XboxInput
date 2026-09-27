@@ -49,23 +49,6 @@ static const XboxInputControllerProfile kControllerProfiles[] = {
 
 #undef WIRED_GIP_PROFILE
 
-static const WORD kDefaultButtonTargets[XBOXINPUT_MAPPING_BUTTON_COUNT] = {
-	XINPUT_GAMEPAD_DPAD_UP,
-	XINPUT_GAMEPAD_DPAD_DOWN,
-	XINPUT_GAMEPAD_DPAD_LEFT,
-	XINPUT_GAMEPAD_DPAD_RIGHT,
-	XINPUT_GAMEPAD_START,
-	XINPUT_GAMEPAD_BACK,
-	XINPUT_GAMEPAD_LEFT_THUMB,
-	XINPUT_GAMEPAD_RIGHT_THUMB,
-	XINPUT_GAMEPAD_LEFT_SHOULDER,
-	XINPUT_GAMEPAD_RIGHT_SHOULDER,
-	XINPUT_GAMEPAD_A,
-	XINPUT_GAMEPAD_B,
-	XINPUT_GAMEPAD_X,
-	XINPUT_GAMEPAD_Y,
-};
-
 const XboxInputControllerProfile* XboxInputFindProfileById(
 	uint16_t vendorId, uint16_t productId, uint16_t revision) {
 	for (DWORD i = 0; i < sizeof(kControllerProfiles) / sizeof(kControllerProfiles[0]); ++i) {
@@ -122,15 +105,6 @@ const char* XboxInputInitProfileName(XboxInputInitProfile initProfile) {
 void XboxInputResetNormalizedState(XboxInputNormalizedState* state) {
 	if (state)
 		memset(state, 0, sizeof(*state));
-}
-
-void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping) {
-	if (!mapping)
-		return;
-	memset(mapping, 0, sizeof(*mapping));
-	for (int i = 0; i < XBOXINPUT_MAPPING_BUTTON_COUNT; ++i)
-		mapping->buttonTargets[i] = kDefaultButtonTargets[i];
-	mapping->rumblePercent = 100;
 }
 
 void XboxInputInitializeRuntime(XboxInputControllerRuntime* runtime,

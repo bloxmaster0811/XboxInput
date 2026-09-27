@@ -123,6 +123,7 @@ enum XboxInputLogEventType {
 	XBOXINPUT_LOG_USB_STEP = 6,
 	XBOXINPUT_LOG_FIRST_INPUT = 7,
 	XBOXINPUT_LOG_RUMBLE = 8,
+	XBOXINPUT_LOG_NOTIFICATION = 9,
 };
 
 enum XboxInputInitStep {
@@ -171,6 +172,26 @@ struct XboxInputLogEvent {
 static volatile LONG g_xboxInputLogEventSerial = 0;
 static XboxInputLogEvent g_xboxInputLogEvents[XBOXINPUT_LOG_EVENT_COUNT];
 static volatile LONG g_xboxInputRemovedUserMask = 0;
+static volatile LONG g_xboxInputRemovedUiMask = 0;
+static volatile LONG g_xboxInputUiWorkerRunning = 0;
+static volatile LONG g_xboxInputUiWorkerTitle = 0;
+static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2);
+
+static void XboxInputSetMaskBit(volatile LONG* mask, LONG bit) {
+	for (;;) {
+		LONG before = *mask;
+		if (InterlockedCompareExchange(mask, before | bit, before) == before)
+			return;
+	}
+}
+
+static void XboxInputClearMaskBit(volatile LONG* mask, LONG bit) {
+	for (;;) {
+		LONG before = *mask;
+		if (InterlockedCompareExchange(mask, before & ~bit, before) == before)
+			return;
+	}
+}
 
 // USB removal callbacks may run above PASSIVE_LEVEL. They may publish one bit here,
 // but must never enter XAM UI code directly; the logger/system thread drains it.
@@ -178,32 +199,27 @@ static void XboxInputQueueRemovedControllerNotification(BYTE userIndex) {
 	if (userIndex >= 4)
 		return;
 	const LONG bit = (LONG)(1u << userIndex);
-	for (;;) {
-		LONG before = g_xboxInputRemovedUserMask;
-		if (InterlockedCompareExchange(&g_xboxInputRemovedUserMask,
-			before | bit, before) == before)
-			return;
-	}
+	XboxInputSetMaskBit(&g_xboxInputRemovedUserMask, bit);
+	XboxInputSetMaskBit(&g_xboxInputRemovedUiMask, bit);
 }
 
 static void XboxInputCancelRemovedControllerNotification(BYTE userIndex) {
 	if (userIndex >= 4)
 		return;
-	const LONG keepMask = ~(LONG)(1u << userIndex);
-	for (;;) {
-		LONG before = g_xboxInputRemovedUserMask;
-		if (InterlockedCompareExchange(&g_xboxInputRemovedUserMask,
-			before & keepMask, before) == before)
-			return;
-	}
+	const LONG bit = (LONG)(1u << userIndex);
+	XboxInputClearMaskBit(&g_xboxInputRemovedUserMask, bit);
+	XboxInputClearMaskBit(&g_xboxInputRemovedUiMask, bit);
 }
 
 static void XboxInputProcessControllerNotifications() {
 	LONG removed = InterlockedExchange(&g_xboxInputRemovedUserMask, 0);
+	DWORD broadcastResult = removed
+		? XNotifyBroadcast(XN_SYS_INPUTDEVICESCHANGED, 0)
+		: 0;
 	for (BYTE user = 0; user < 4; ++user) {
 		if (removed & (1u << user)) {
-			XNotifyQueueUI(XNOTIFYUI_TYPE_REMOVEDGAMEPAD, user,
-				XNOTIFYUI_PRIORITY_HIGH, L"Please reconnect controller", 0);
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_NOTIFICATION, user,
+				broadcastResult);
 		}
 	}
 }
@@ -440,6 +456,7 @@ Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
 Detour XamInputSetStateDetour;
 Detour XamInputGetCapabilitiesDetour;
+Detour XamInputGetStateDetour;
 Detour XInputdReadStateDetour;
 Detour XamInputGetCapabilitiesDetour2;   // plain XamInputGetCapabilities, ordinal 400
 #define XNOTIFYUI_CUSTOM (XNOTIFYQUEUEUI_TYPE)80
@@ -701,6 +718,10 @@ static DWORD XboxInputLogThread(PVOID) {
 					break;
 				case XBOXINPUT_LOG_RUMBLE:
 					fprintf(file, "tick=%lu event=rumble user=%u motors=%08X\r\n",
+						event->tick, event->value1, event->value2);
+					break;
+				case XBOXINPUT_LOG_NOTIFICATION:
+					fprintf(file, "tick=%lu event=disconnect_notification user=%u broadcast=%08X\r\n",
 						event->tick, event->value1, event->value2);
 					break;
 				default:
@@ -2407,10 +2428,8 @@ static int32_t GipGamepadRumbleComplete(DWORD trbAddr, int32_t status) {
 static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor) {
 	if (!g_gipOutOpen || !h)
 		return -1;
-	const BYTE payload[9] = {
-		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
-		0xFF, 0x00, 0x00
-	};
+	BYTE payload[9];
+	XboxInputBuildGipRumblePayload(leftMotor, rightMotor, payload);
 	int i = 0;
 	g_gipRumbleBuf[i++] = GIP_CMD_RUMBLE;
 	g_gipRumbleBuf[i++] = 0x00;
@@ -2560,10 +2579,8 @@ static int32_t GipSessionRumbleComplete(DWORD trbAddr, int32_t status) {
 static int GipSessionQueueRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
 	if (!session || !session->outOpen || !session->ext.deviceHandle)
 		return -1;
-	const BYTE payload[9] = {
-		0x00, 0x03, 0x00, 0x00, leftMotor, rightMotor,
-		0xFF, 0x00, 0x00
-	};
+	BYTE payload[9];
+	XboxInputBuildGipRumblePayload(leftMotor, rightMotor, payload);
 	int i = 0;
 	session->rumbleBuf[i++] = GIP_CMD_RUMBLE;
 	session->rumbleBuf[i++] = 0x00;
@@ -3069,14 +3086,14 @@ static BYTE GipSubTypeForCurrentTitle() {
 				}
 			}
 
-			// riffmaster.ini wins over the built-in table. Title IDs differ between
+			// XboxInput.ini wins over the built-in table. Title IDs differ between
 			// regions and reissues, so a user with a PAL disc must be able to fix it
 			// without rebuilding - and equally must be able to override an entry of
 			// ours that turns out to be wrong on their console.
 			BYTE user = RmCfgSubTypeOverride(id);
 			if (user) {
 				s_subType = user;
-				why = "riffmaster.ini";
+				why = "XboxInput.ini";
 			}
 			// One line per title change. Safe on this hot path precisely because a
 			// title change is rare; do not move this outside the `id != s_titleId` test.
@@ -3690,17 +3707,18 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 			break;
 
 		case GIP_CMD_VIRTUAL_KEY:
-			if (hdr.packetLength >= 2 && payload[1] == GIP_VKEY_GUIDE) {
-				const bool down = payload[0] != 0;
+			{
+				const bool wasDown = g_gipRuntime.guideDown;
+				if (XboxInputApplyGipGuidePayload(payload, (int)hdr.packetLength,
+					&g_gipRuntime.guideDown, &g_gipRuntime.guidePending)) {
+					const bool down = g_gipRuntime.guideDown;
 				// Ignore any repeated DOWN packet while the physical button remains
 				// held. Otherwise it can be interpreted as a second dashboard press,
 				// immediately closing the Guide that the first one opened.
-				if (down && !g_gipRuntime.guideDown)
-					g_gipRuntime.guidePending = true;
-				if (down && !g_gipRuntime.guideDown)
+				if (down && !wasDown)
 					g_gipGuideOverlayOpen = !g_gipGuideOverlayOpen;
-				g_gipRuntime.guideDown = down;
 				RM_DBG("RIFFMASTER: GIP GUIDE %s\r\n", payload[0] ? "DOWN" : "UP");
+				}
 			}
 			break;
 
@@ -3809,12 +3827,8 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 			}
 			break;
 		case GIP_CMD_VIRTUAL_KEY:
-			if (hdr.packetLength >= 2 && payload[1] == GIP_VKEY_GUIDE) {
-				bool down = payload[0] != 0;
-				if (down && !session->runtime.guideDown)
-					session->runtime.guidePending = true;
-				session->runtime.guideDown = down;
-			}
+			XboxInputApplyGipGuidePayload(payload, (int)hdr.packetLength,
+				&session->runtime.guideDown, &session->runtime.guidePending);
 			break;
 		case GIP_CMD_INPUT:
 			if (GipParseGamepadInput(payload, (int)hdr.packetLength,
@@ -4971,8 +4985,12 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration)
 		user = 0;
 	GipControllerRef controller;
 	if (GipControllerFromUser((uint8_t)user, &controller)) {
-		const BYTE left = vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0;
-		const BYTE right = vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0;
+		const BYTE left = XboxInputScaleRumble(
+			vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0,
+			g_xboxInputGamepadMapping.rumblePercent);
+		const BYTE right = XboxInputScaleRumble(
+			vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0,
+			g_xboxInputGamepadMapping.rumblePercent);
 		GipControllerSendRumble(&controller, left, right);
 		return ERROR_SUCCESS;
 	}
@@ -5087,6 +5105,64 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 		caps->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
 	}
+	return status;
+}
+
+static DWORD XboxInputTitleUiWorker(PVOID parameter) {
+	DWORD workerTitle = (DWORD)(ULONG_PTR)parameter;
+	typedef DWORD(*xam_get_current_title_id_t)(void);
+	for (;;) {
+		if (!XamGetCurrentTitleIdPtr ||
+			((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)() != workerTitle)
+			break;
+
+		LONG removed = InterlockedExchange(&g_xboxInputRemovedUiMask, 0);
+		if (removed) {
+			BOOL show = TRUE, movie = TRUE, sound = TRUE, iptv = TRUE;
+			XNotifyUIGetOptions(&show, &movie, &sound, &iptv);
+			// A reconnect warning must remain visible even when ordinary toast
+			// previews were disabled. Restore the user's preference afterwards.
+			XNotifyUISetOptions(TRUE, movie, sound, iptv);
+			XNotifyQueueUI(XNOTIFYUI_TYPE_CONSOLEMESSAGE, XUSER_INDEX_ANY,
+				XNOTIFY_SYSTEM, L"Please reconnect controller", 0);
+			// XAM's normal banner includes entrance, dwell and exit phases. Restoring
+			// pfShow during any phase freezes the visual in place.
+			Sleep(7000);
+			XNotifyUISetOptions(show, movie, sound, iptv);
+		}
+		Sleep(50);
+	}
+	if ((DWORD)g_xboxInputUiWorkerTitle == workerTitle)
+		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
+	return 0;
+}
+
+static void XboxInputEnsureTitleUiWorker() {
+	if (!XamGetCurrentTitleIdPtr || KeGetCurrentProcessType() != PROC_USER)
+		return;
+	typedef DWORD(*xam_get_current_title_id_t)(void);
+	DWORD title = ((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)();
+	if ((DWORD)g_xboxInputUiWorkerTitle != title) {
+		InterlockedExchange(&g_xboxInputUiWorkerTitle, (LONG)title);
+		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
+	}
+	if (InterlockedCompareExchange(&g_xboxInputUiWorkerRunning, 1, 0) != 0)
+		return;
+	HANDLE thread = CreateThread(0, 0,
+		(LPTHREAD_START_ROUTINE)XboxInputTitleUiWorker,
+		(PVOID)(ULONG_PTR)title, 0, 0);
+	if (thread)
+		CloseHandle(thread);
+	else
+		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
+}
+
+// Lazily establish a title-owned watcher while the game is still polling.
+// It remains alive after the disconnect causes the game to stop polling.
+HRESULT XamInputGetStateHook(DWORD user, DWORD deviceContext, XINPUT_STATE* state) {
+	XboxInputEnsureTitleUiWorker();
+	HRESULT status = XamInputGetStateDetour
+		.GetOriginal<decltype(&XamInputGetStateHook)>()(user, deviceContext, state);
 	return status;
 }
 
@@ -5237,6 +5313,7 @@ bool initFunctionPointers() {
 	// Ordinals cross-checked against Xenia's export table
 	// (refs/xenia/src/xenia/kernel/xam/xam_table.inc:197-199, 481).
 	XexGetProcedureAddress(xamHandle, 400, &XamInputGetCapabilitiesPtr);
+	XexGetProcedureAddress(xamHandle, 401, &XamInputGetStatePtr);
 	XexGetProcedureAddress(xamHandle, 746, &XamIsSysUiInvokedByXenonButton);
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
 	XexGetProcedureAddress(xamHandle, 402, &XamInputSetState);
@@ -5266,6 +5343,7 @@ bool initFunctionPointers() {
 	if (!XamInputGetCapabilitiesEx)     missing |= 0x00000400;
 	if (!XamInputSetState)              missing |= 0x00000800;
 	if (!XamInputGetCapabilitiesPtr)    missing |= 0x00001000;
+	if (!XamInputGetStatePtr)           missing |= 0x00008000;
 #ifndef RIFFMASTER_NO_NOTIFY_PATCH
 	if (!NotificationPatchPtr)          missing |= 0x00002000;
 #endif
@@ -5452,6 +5530,7 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// built-in defaults, and one gets written out with comments for next boot.
 		// Read here, at load, and never again: everything downstream only reads the
 		// parsed globals, so no hot path or raised-IRQL context ever touches the disk.
+		XboxInputSetDefaultMapping(&g_xboxInputGamepadMapping);
 		bool cfgFound = RmCfgLoad(RM_CFG_PATH);
 		RM_LOG("RIFFMASTER: config %s - tilt %d, SP tilt=%d click=%d, solo=%d, "
 			"invertStrum=%d, default SubType 0x%02X, %d ini override(s)\r\n",
@@ -5459,6 +5538,19 @@ static DWORD XboxInputInitializeThread(PVOID) {
 			g_rmCfg.tiltThreshold, g_rmCfg.starPowerTilt, g_rmCfg.starPowerClick,
 			g_rmCfg.soloFlag, g_rmCfg.invertStrum, g_rmCfg.defaultSubType,
 			g_rmCfg.overrideCount);
+		RM_LOG("XBOXINPUT: mapping swapSticks=%d swapTriggers=%d invert=%d/%d/%d/%d "
+			"stickDz=%u/%u triggerDz=%u/%u rumble=%u%%\r\n",
+			g_xboxInputGamepadMapping.swapSticks,
+			g_xboxInputGamepadMapping.swapTriggers,
+			g_xboxInputGamepadMapping.invertLeftX,
+			g_xboxInputGamepadMapping.invertLeftY,
+			g_xboxInputGamepadMapping.invertRightX,
+			g_xboxInputGamepadMapping.invertRightY,
+			g_xboxInputGamepadMapping.leftStickDeadzone,
+			g_xboxInputGamepadMapping.rightStickDeadzone,
+			g_xboxInputGamepadMapping.leftTriggerDeadzone,
+			g_xboxInputGamepadMapping.rightTriggerDeadzone,
+			g_xboxInputGamepadMapping.rumblePercent);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_CONFIG_LOADED,
 			(cfgFound ? 0x80000000 : 0) | (g_rmCfg.overrideCount & 0xFFFF));
 
@@ -5509,6 +5601,7 @@ static DWORD XboxInputInitializeThread(PVOID) {
 #if RIFFMASTER_LEVEL >= RM_LVL_XAMHOOKS
 		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
 		XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
+		XamInputGetStateDetour = Detour(XamInputGetStatePtr, (void*)XamInputGetStateHook);
 		if (XamInputGetCapabilitiesPtr) {
 			XamInputGetCapabilitiesDetour2 = Detour(XamInputGetCapabilitiesPtr, (void*)XamInputGetCapabilitiesHook);
 			XamInputGetCapabilitiesDetour2.Install();
@@ -5519,6 +5612,7 @@ static DWORD XboxInputInitializeThread(PVOID) {
 
 		XamInputSetStateDetour.Install();
 		XamInputGetCapabilitiesDetour.Install();
+		XamInputGetStateDetour.Install();
 		XInputdReadStateDetour.Install();
 		XboxInputSetDiagStage(11);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_XAM_HOOKS_READY, 0);

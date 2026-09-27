@@ -20,6 +20,8 @@
 #include <xtl.h>
 #include "riffmaster_config.h"
 #include "controller_backend.h"
+#include "gip_gamepad_parser.h"
+#include "gamepad_mapping.h"
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
@@ -312,53 +314,45 @@ static void RiffmasterToXInput(const RiffmasterState* s, XINPUT_GAMEPAD* g) {
 	g->sThumbLY = 0;
 }
 
-// Standard Xbox One / Series wired-gamepad input (GIP command 0x20).  GIP
-// fields are little-endian on the wire; assemble them bytewise for the 360's
-// big-endian PPC target.
+// Standard Xbox One / Series wired-gamepad input (GIP command 0x20). The
+// protocol parser is XDK-neutral so production code and host tests share it.
 typedef XboxInputNormalizedState GipGamepadState;
 
-static WORD GipReadLe16(const BYTE* p) {
-	return (WORD)(p[0] | ((WORD)p[1] << 8));
-}
-
 static bool GipParseGamepadInput(const BYTE* p, int len, GipGamepadState* s) {
-	if (!p || !s || len < 14) return false;
-	const BYTE low = p[0], high = p[1];
-	WORD buttons = 0;
-	if (low & 0x10) buttons |= XINPUT_GAMEPAD_A;
-	if (low & 0x20) buttons |= XINPUT_GAMEPAD_B;
-	if (low & 0x40) buttons |= XINPUT_GAMEPAD_X;
-	if (low & 0x80) buttons |= XINPUT_GAMEPAD_Y;
-	if (low & 0x04) buttons |= XINPUT_GAMEPAD_START;
-	if (low & 0x08) buttons |= XINPUT_GAMEPAD_BACK;
-	if (high & 0x01) buttons |= XINPUT_GAMEPAD_DPAD_UP;
-	if (high & 0x02) buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
-	if (high & 0x04) buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
-	if (high & 0x08) buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
-	if (high & 0x10) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
-	if (high & 0x20) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-	if (high & 0x40) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-	if (high & 0x80) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
-	s->buttons = buttons;
-	s->leftTrigger = (BYTE)(GipReadLe16(p + 2) >> 2);
-	s->rightTrigger = (BYTE)(GipReadLe16(p + 4) >> 2);
-	s->leftX = (SHORT)GipReadLe16(p + 6);
-	s->leftY = (SHORT)GipReadLe16(p + 8);
-	s->rightX = (SHORT)GipReadLe16(p + 10);
-	s->rightY = (SHORT)GipReadLe16(p + 12);
+	if (!s) return false;
+	XboxInputGipGamepadState parsed;
+	if (!XboxInputParseGipGamepadPayload(p, len, &parsed))
+		return false;
+	s->buttons = parsed.buttons;
+	s->leftTrigger = parsed.leftTrigger;
+	s->rightTrigger = parsed.rightTrigger;
+	s->leftX = parsed.leftX;
+	s->leftY = parsed.leftY;
+	s->rightX = parsed.rightX;
+	s->rightY = parsed.rightY;
 	return true;
 }
 
 static void GipGamepadToXInput(const GipGamepadState* s, XINPUT_GAMEPAD* g) {
 	if (!s || !g) return;
+	XboxInputGipGamepadState input;
+	input.buttons = s->buttons;
+	input.leftTrigger = s->leftTrigger;
+	input.rightTrigger = s->rightTrigger;
+	input.leftX = s->leftX;
+	input.leftY = s->leftY;
+	input.rightX = s->rightX;
+	input.rightY = s->rightY;
+	XboxInputGipGamepadState mapped;
+	XboxInputApplyGamepadMapping(&input, &g_xboxInputGamepadMapping, &mapped);
 	memset(g, 0, sizeof(XINPUT_GAMEPAD));
-	g->wButtons = s->buttons;
-	g->bLeftTrigger = s->leftTrigger;
-	g->bRightTrigger = s->rightTrigger;
-	g->sThumbLX = s->leftX;
-	g->sThumbLY = s->leftY;
-	g->sThumbRX = s->rightX;
-	g->sThumbRY = s->rightY;
+	g->wButtons = mapped.buttons;
+	g->bLeftTrigger = mapped.leftTrigger;
+	g->bRightTrigger = mapped.rightTrigger;
+	g->sThumbLX = mapped.leftX;
+	g->sThumbLY = mapped.leftY;
+	g->sThumbRX = mapped.rightX;
+	g->sThumbRY = mapped.rightY;
 }
 
 #endif // GIP_RIFFMASTER_H
