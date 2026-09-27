@@ -73,6 +73,20 @@ struct XboxInputControllerProfile {
 	XboxInputUsbInterfaceIdentity interfaceIdentity;
 };
 
+enum XboxInputProfileMatchResult {
+	XBOXINPUT_PROFILE_MATCHED = 0,
+	XBOXINPUT_PROFILE_MISSING_DEVICE_DESCRIPTOR,
+	XBOXINPUT_PROFILE_MISSING_INTERFACE_DESCRIPTOR,
+	XBOXINPUT_PROFILE_UNKNOWN_VID_PID,
+	XBOXINPUT_PROFILE_REVISION_OUT_OF_RANGE,
+	XBOXINPUT_PROFILE_INTERFACE_NUMBER_MISMATCH,
+	XBOXINPUT_PROFILE_ALTERNATE_SETTING_MISMATCH,
+	XBOXINPUT_PROFILE_ENDPOINT_COUNT_MISMATCH,
+	XBOXINPUT_PROFILE_CLASS_MISMATCH,
+	XBOXINPUT_PROFILE_SUBCLASS_MISMATCH,
+	XBOXINPUT_PROFILE_PROTOCOL_MISMATCH,
+};
+
 // Common output of every future parser.  The field names intentionally match
 // the proven GIP state during the first migration stage, making the type change
 // layout- and behaviour-preserving.
@@ -118,11 +132,18 @@ const XboxInputControllerProfile* XboxInputMatchProfile(
 	uint16_t vendorId, uint16_t productId, uint16_t revision,
 	const XboxInputUsbInterfaceIdentity* interfaceIdentity);
 
+XboxInputProfileMatchResult XboxInputDiagnoseProfileMatch(
+	uint16_t vendorId, uint16_t productId, uint16_t revision,
+	const XboxInputUsbInterfaceIdentity* interfaceIdentity,
+	const XboxInputControllerProfile** candidateProfile);
+
 bool XboxInputProfileMatchesInterface(const XboxInputControllerProfile* profile,
 	const XboxInputUsbInterfaceIdentity* interfaceIdentity);
 
 const char* XboxInputTransportName(XboxInputTransportType transport);
+const char* XboxInputParserName(XboxInputParserType parser);
 const char* XboxInputInitProfileName(XboxInputInitProfile initProfile);
+const char* XboxInputProfileMatchResultName(XboxInputProfileMatchResult result);
 
 void XboxInputResetNormalizedState(XboxInputNormalizedState* state);
 void XboxInputInitializeRuntime(XboxInputControllerRuntime* runtime,

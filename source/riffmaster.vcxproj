@@ -51,7 +51,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;RIFFMASTER_GIP_ONLY;RIFFMASTER_NO_USB_RESET;RIFFMASTER_KEEP_DRIVER;$(XboxInputCompatProbe);$(XboxInputLoadNotify);$(XboxInputWgcWorkaround);$(XboxInputDisableFileLog);$(XboxInputNullLogger)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;RIFFMASTER_GIP_ONLY;RIFFMASTER_NO_USB_RESET;RIFFMASTER_NO_NOTIFY_PATCH;RIFFMASTER_KEEP_DRIVER;$(XboxInputCompatProbe);$(XboxInputLoadNotify);$(XboxInputWgcWorkaround);$(XboxInputDisableFileLog);$(XboxInputNullLogger)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -98,6 +98,8 @@
     <ClInclude Include="riffmaster_config.h" />
     <ClInclude Include="riffmaster_build.h" />
     <ClInclude Include="controller_backend.h" />
+    <ClInclude Include="gip_gamepad_parser.h" />
+    <ClInclude Include="gamepad_mapping.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="hid_parser.cpp" />
@@ -105,6 +107,8 @@
     <ClCompile Include="Detours.cpp" />
     <ClCompile Include="mapping.cpp" />
     <ClCompile Include="controller_backend.cpp" />
+    <ClCompile Include="gip_gamepad_parser.cpp" />
+    <ClCompile Include="gamepad_mapping.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />

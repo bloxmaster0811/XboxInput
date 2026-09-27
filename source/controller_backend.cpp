@@ -79,9 +79,39 @@ bool XboxInputProfileMatchesInterface(const XboxInputControllerProfile* profile,
 const XboxInputControllerProfile* XboxInputMatchProfile(
 	uint16_t vendorId, uint16_t productId, uint16_t revision,
 	const XboxInputUsbInterfaceIdentity* interfaceIdentity) {
+	const XboxInputControllerProfile* profile = 0;
+	return XboxInputDiagnoseProfileMatch(vendorId, productId, revision,
+		interfaceIdentity, &profile) == XBOXINPUT_PROFILE_MATCHED ? profile : 0;
+}
+
+XboxInputProfileMatchResult XboxInputDiagnoseProfileMatch(
+	uint16_t vendorId, uint16_t productId, uint16_t revision,
+	const XboxInputUsbInterfaceIdentity* interfaceIdentity,
+	const XboxInputControllerProfile** candidateProfile) {
+	if (candidateProfile) *candidateProfile = 0;
 	const XboxInputControllerProfile* profile =
-		XboxInputFindProfileById(vendorId, productId, revision);
-	return XboxInputProfileMatchesInterface(profile, interfaceIdentity) ? profile : 0;
+		XboxInputFindProfileById(vendorId, productId, 0);
+	if (!profile) return XBOXINPUT_PROFILE_UNKNOWN_VID_PID;
+	if (candidateProfile) *candidateProfile = profile;
+	if (revision != 0 && (revision < profile->minimumRevision ||
+		revision > profile->maximumRevision))
+		return XBOXINPUT_PROFILE_REVISION_OUT_OF_RANGE;
+	if (!interfaceIdentity)
+		return XBOXINPUT_PROFILE_MISSING_INTERFACE_DESCRIPTOR;
+	const XboxInputUsbInterfaceIdentity* expected = &profile->interfaceIdentity;
+	if (interfaceIdentity->number != expected->number)
+		return XBOXINPUT_PROFILE_INTERFACE_NUMBER_MISMATCH;
+	if (interfaceIdentity->alternateSetting != expected->alternateSetting)
+		return XBOXINPUT_PROFILE_ALTERNATE_SETTING_MISMATCH;
+	if (interfaceIdentity->endpointCount != expected->endpointCount)
+		return XBOXINPUT_PROFILE_ENDPOINT_COUNT_MISMATCH;
+	if (interfaceIdentity->interfaceClass != expected->interfaceClass)
+		return XBOXINPUT_PROFILE_CLASS_MISMATCH;
+	if (interfaceIdentity->interfaceSubClass != expected->interfaceSubClass)
+		return XBOXINPUT_PROFILE_SUBCLASS_MISMATCH;
+	if (interfaceIdentity->interfaceProtocol != expected->interfaceProtocol)
+		return XBOXINPUT_PROFILE_PROTOCOL_MISMATCH;
+	return XBOXINPUT_PROFILE_MATCHED;
 }
 
 const char* XboxInputTransportName(XboxInputTransportType transport) {
@@ -94,11 +124,38 @@ const char* XboxInputTransportName(XboxInputTransportType transport) {
 	}
 }
 
+const char* XboxInputParserName(XboxInputParserType parser) {
+	switch (parser) {
+	case XBOXINPUT_PARSER_GIP_STANDARD: return "gip-standard";
+	case XBOXINPUT_PARSER_GIP_ELITE: return "gip-elite";
+	case XBOXINPUT_PARSER_HID_DESCRIPTOR: return "hid-descriptor";
+	case XBOXINPUT_PARSER_HID_FIXED: return "hid-fixed";
+	default: return "none";
+	}
+}
+
 const char* XboxInputInitProfileName(XboxInputInitProfile initProfile) {
 	switch (initProfile) {
 	case XBOXINPUT_INIT_GIP_STANDARD: return "gip-standard";
 	case XBOXINPUT_INIT_GIP_POWERA_543A: return "gip-powera-543a";
 	default: return "none";
+	}
+}
+
+const char* XboxInputProfileMatchResultName(XboxInputProfileMatchResult result) {
+	switch (result) {
+	case XBOXINPUT_PROFILE_MATCHED: return "matched";
+	case XBOXINPUT_PROFILE_MISSING_DEVICE_DESCRIPTOR: return "missing_device_descriptor";
+	case XBOXINPUT_PROFILE_MISSING_INTERFACE_DESCRIPTOR: return "missing_interface_descriptor";
+	case XBOXINPUT_PROFILE_UNKNOWN_VID_PID: return "unknown_vid_pid";
+	case XBOXINPUT_PROFILE_REVISION_OUT_OF_RANGE: return "revision_out_of_range";
+	case XBOXINPUT_PROFILE_INTERFACE_NUMBER_MISMATCH: return "interface_number_mismatch";
+	case XBOXINPUT_PROFILE_ALTERNATE_SETTING_MISMATCH: return "alternate_setting_mismatch";
+	case XBOXINPUT_PROFILE_ENDPOINT_COUNT_MISMATCH: return "endpoint_count_mismatch";
+	case XBOXINPUT_PROFILE_CLASS_MISMATCH: return "interface_class_mismatch";
+	case XBOXINPUT_PROFILE_SUBCLASS_MISMATCH: return "interface_subclass_mismatch";
+	case XBOXINPUT_PROFILE_PROTOCOL_MISMATCH: return "interface_protocol_mismatch";
+	default: return "unknown_result";
 	}
 }
 

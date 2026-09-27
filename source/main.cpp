@@ -124,6 +124,8 @@ enum XboxInputLogEventType {
 	XBOXINPUT_LOG_FIRST_INPUT = 7,
 	XBOXINPUT_LOG_RUMBLE = 8,
 	XBOXINPUT_LOG_NOTIFICATION = 9,
+	XBOXINPUT_LOG_PROFILE_DECISION = 10,
+	XBOXINPUT_LOG_NOTIFICATION_CANCELLED = 11,
 };
 
 enum XboxInputInitStep {
@@ -168,14 +170,20 @@ struct XboxInputLogEvent {
 	DWORD type;
 	DWORD value1;
 	DWORD value2;
+	DWORD value3;
+	DWORD value4;
+	DWORD value5;
 };
 static volatile LONG g_xboxInputLogEventSerial = 0;
 static XboxInputLogEvent g_xboxInputLogEvents[XBOXINPUT_LOG_EVENT_COUNT];
 static volatile LONG g_xboxInputRemovedUserMask = 0;
 static volatile LONG g_xboxInputRemovedUiMask = 0;
+static volatile LONG g_xboxInputDisconnectedUiMask = 0;
 static volatile LONG g_xboxInputUiWorkerRunning = 0;
 static volatile LONG g_xboxInputUiWorkerTitle = 0;
 static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2);
+static void XboxInputQueueLogEventEx(DWORD type, DWORD value1, DWORD value2,
+	DWORD value3, DWORD value4, DWORD value5);
 
 static void XboxInputSetMaskBit(volatile LONG* mask, LONG bit) {
 	for (;;) {
@@ -201,6 +209,7 @@ static void XboxInputQueueRemovedControllerNotification(BYTE userIndex) {
 	const LONG bit = (LONG)(1u << userIndex);
 	XboxInputSetMaskBit(&g_xboxInputRemovedUserMask, bit);
 	XboxInputSetMaskBit(&g_xboxInputRemovedUiMask, bit);
+	XboxInputSetMaskBit(&g_xboxInputDisconnectedUiMask, bit);
 }
 
 static void XboxInputCancelRemovedControllerNotification(BYTE userIndex) {
@@ -209,6 +218,7 @@ static void XboxInputCancelRemovedControllerNotification(BYTE userIndex) {
 	const LONG bit = (LONG)(1u << userIndex);
 	XboxInputClearMaskBit(&g_xboxInputRemovedUserMask, bit);
 	XboxInputClearMaskBit(&g_xboxInputRemovedUiMask, bit);
+	XboxInputClearMaskBit(&g_xboxInputDisconnectedUiMask, bit);
 }
 
 static void XboxInputProcessControllerNotifications() {
@@ -225,6 +235,11 @@ static void XboxInputProcessControllerNotifications() {
 }
 
 static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
+	XboxInputQueueLogEventEx(type, value1, value2, 0, 0, 0);
+}
+
+static void XboxInputQueueLogEventEx(DWORD type, DWORD value1, DWORD value2,
+	DWORD value3, DWORD value4, DWORD value5) {
 	LONG serial = InterlockedIncrement(&g_xboxInputLogEventSerial);
 	XboxInputLogEvent* event =
 		&g_xboxInputLogEvents[(serial - 1) % XBOXINPUT_LOG_EVENT_COUNT];
@@ -233,6 +248,9 @@ static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
 	event->type = type;
 	event->value1 = value1;
 	event->value2 = value2;
+	event->value3 = value3;
+	event->value4 = value4;
+	event->value5 = value5;
 	__sync();
 	event->serial = serial;
 }
@@ -724,6 +742,44 @@ static DWORD XboxInputLogThread(PVOID) {
 					fprintf(file, "tick=%lu event=disconnect_notification user=%u broadcast=%08X\r\n",
 						event->tick, event->value1, event->value2);
 					break;
+				case XBOXINPUT_LOG_NOTIFICATION_CANCELLED:
+					fprintf(file, "tick=%lu event=disconnect_notification_cancelled reason=%s remaining=%08X\r\n",
+						event->tick, event->value1 ? "timeout" : "reconnected",
+						event->value2);
+					break;
+				case XBOXINPUT_LOG_PROFILE_DECISION: {
+					WORD vid = (WORD)(event->value1 >> 16);
+					WORD pid = (WORD)event->value1;
+					WORD revision = (WORD)(event->value2 >> 16);
+					XboxInputProfileMatchResult result =
+						(XboxInputProfileMatchResult)(event->value2 & 0xFFFF);
+					const XboxInputControllerProfile* profile =
+						XboxInputFindProfileById(vid, pid, 0);
+					fprintf(file,
+						"tick=%lu event=profile_decision vid=%04X pid=%04X revision=%04X "
+						"interface=%u alt=%u endpoints=%u class=%02X/%02X/%02X "
+						"usbStatus=%08X result=%s action=%s profile=%s transport=%s parser=%s init=%s "
+						"caps=%08X quirks=%08X expected=%u/%u/%u/%02X/%02X/%02X\r\n",
+						event->tick, vid, pid, revision,
+						(BYTE)(event->value3 >> 24), (BYTE)(event->value3 >> 16),
+						(BYTE)(event->value3 >> 8), (BYTE)event->value3,
+						(BYTE)(event->value4 >> 8), (BYTE)event->value4,
+						event->value5, XboxInputProfileMatchResultName(result),
+						result == XBOXINPUT_PROFILE_MATCHED ? "claim_candidate" : "observe_only",
+						profile ? profile->name : "none",
+						profile ? XboxInputTransportName(profile->transport) : "none",
+						profile ? XboxInputParserName(profile->parser) : "none",
+						profile ? XboxInputInitProfileName(profile->initProfile) : "none",
+						profile ? profile->capabilities : 0,
+						profile ? profile->quirks : 0,
+						profile ? profile->interfaceIdentity.number : 0,
+						profile ? profile->interfaceIdentity.alternateSetting : 0,
+						profile ? profile->interfaceIdentity.endpointCount : 0,
+						profile ? profile->interfaceIdentity.interfaceClass : 0,
+						profile ? profile->interfaceIdentity.interfaceSubClass : 0,
+						profile ? profile->interfaceIdentity.interfaceProtocol : 0);
+					break;
+				}
 				default:
 					fprintf(file, "tick=%lu event=unknown type=%u value1=%08X value2=%08X\r\n",
 						event->tick, event->type, event->value1, event->value2);
@@ -2159,73 +2215,15 @@ static XboxInputUsbInterfaceIdentity XboxInputInterfaceIdentity(
 // plus two more after power-down. Teardown used to reset this counter, so every bounce
 // bought three fresh claims and the storm ran unbounded.
 //
-// That is dangerous because g_gipExt is a SINGLE STATIC struct shared by every
-// incarnation of the device:
-//   - teardown calls UsbdQueueCloseEndpoint(dead, &g_gipExt.interruptTrb), which is
-//     asynchronous - the kernel still owns that TRB when it returns
-//   - the next claim memsets g_gipExt and re-queues the very same TRB
-//   - GipInterruptComplete recovers `ext` from the TRB address, so a completion still
-//     in flight from the OLD device passes the `ext->deviceHandle` guard as soon as a
-//     NEW handle has been stored there
-// Re-queueing a TRB the kernel already has in its transfer list corrupts that list.
-//
-// Capping the storm is a mitigation, not a cure - the real fix is a per-device
-// extension so incarnations cannot share a TRB.
+// Reusing one static extension across disconnect/reconnect was dangerous because an
+// asynchronous completion from the old device could arrive after the same TRB had
+// been queued for the new one. Claims now receive a fresh fixed session slot and
+// teardown retires it for the rest of the boot. The attempt cap remains a second
+// boundary against devices that repeatedly bounce during enumeration.
 #define GIP_CLAIM_MAX_ATTEMPTS 3
 static int g_gipClaimAttempts = 0;
-static HidControllerExtension g_gipExt;
-static uint16_t g_gipVendorId = 0;
-static uint16_t g_gipProductId = 0;
-static XboxInputControllerRuntime g_gipRuntime;
-
-// Read buffer for the GIP interrupt IN endpoint. wMaxPacketSize is 64
-// (docs/gip_riffmaster.md section 2, read from the descriptor, not assumed).
-// Static rather than malloc'd - this is touched from a USB completion callback.
 #define GIP_READ_BUF_SIZE 64
-static BYTE g_gipReadBuf[GIP_READ_BUF_SIZE];
-static int  g_gipPacketsSeen = 0;
-static int  g_gipInputsSeen = 0;
-static bool g_gipGuideOverlayOpen = false;
-
-// ---- host -> device side ----------------------------------------------------
-// The device ANNOUNCEs every ~500 ms until the host answers with IDENTIFY. Without
-// a reply it never advances to streaming input - exactly what we observed (seq 1..72).
-static UsbTrb  g_gipOutTrb;
-// Round-robin TX buffers. SendInterruptRequest is ASYNCHRONOUS: it hands the buffer to
-// the USB stack and returns. Reusing one buffer meant a chunk ACK and the following
-// POWER ON could clobber each other in flight - which is exactly what happened on the
-// first run (identify ACKed fine, POWER ON sent, then silence).
 #define GIP_TX_BUFS 12
-static BYTE    g_gipOutBuf[GIP_TX_BUFS][64];
-static int     g_gipOutBufIdx = 0;
-static bool    g_gipOutOpen = false;
-// Official pads may wait for host POWER before their first ANNOUNCE. Keep this
-// transfer serialized ahead of the first IN read so the shared OUT TRB cannot
-// be reused by IDENTIFY while POWER is still owned by the USB stack.
-static BYTE    g_gipEarlyPowerBuf[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
-static volatile LONG g_gipEarlyPowerBusy = 0;
-static deviceHandle* g_gipEarlyPowerHandle = 0;
-static uint16_t g_gipEarlyPowerPacketSize = GIP_READ_BUF_SIZE;
-// Rumble is called by XAM far more frequently than actual motor state changes.
-// UsbdQueueAsyncTransfer is asynchronous, so reusing g_gipOutTrb for each call
-// while the USB core still owns it corrupts the transfer list.  Keep exactly one
-// rumble transfer in flight and coalesce any newer request behind it.
-static BYTE    g_gipRumbleBuf[64];
-static volatile LONG g_gipRumbleInFlight = 0;
-static volatile LONG g_gipRumblePending = 0;
-static BYTE    g_gipRumbleRequestedLeft = 0;
-static BYTE    g_gipRumbleRequestedRight = 0;
-static BYTE    g_gipRumbleLastLeft = 0;
-static BYTE    g_gipRumbleLastRight = 0;
-static bool    g_gipRumbleHaveLast = false;
-static uint8_t g_gipSeq = 1;
-static bool    g_gipIdentifySent = false;
-// A controller repeats ANNOUNCE until it receives IDENTIFY.  The original
-// one-shot gate meant one dropped outbound transfer left that session stuck
-// until the cable was physically replugged.
-static bool    g_gipIdentifyReplySeen = false;
-static DWORD   g_gipLastIdentifyTick = 0;
-static bool    g_gipPoweredOn = false;
 // PowerA 24C6:543A needs a host-initiated POWER packet before ANNOUNCE and a
 // short, ordered post-IDENTIFY sequence before it starts reporting input.
 // Keep this entirely separate from normal rumble so every init transfer owns
@@ -2240,9 +2238,6 @@ enum PowerAInitStage {
 	POWERA_INIT_RUMBLE_STOP,
 	POWERA_INIT_COMPLETE,
 };
-static volatile LONG g_powerAInitStage = POWERA_INIT_IDLE;
-static volatile LONG g_powerAIdentifyComplete = 0;
-static BYTE g_powerAInitBuf[64];
 // The normal wired gamepad does not use the RiffMaster dongle's RSA path.
 static bool    g_gipAuthStarted = true;
 static uint32_t g_gipChunkTotal = 0;
@@ -2257,7 +2252,7 @@ static GipTranscript g_gipTranscript;
 static BYTE     g_gipHostFinish[50];
 static bool     g_gipHostFinishReady = false;
 
-// ---- multi-controller ownership foundation ---------------------------------
+// ---- unified controller-session ownership ----------------------------------
 //
 // USB completion callbacks recover HidControllerExtension from the address of a
 // field inside it (interruptTrb is at +4 and controlTrb at +36).  A multi-pad
@@ -2265,18 +2260,16 @@ static bool     g_gipHostFinishReady = false;
 // extension, transfer requests and buffers; sharing the old globals across two
 // devices can re-queue a TRB still owned by the USB stack.
 //
-// These additional slots are deliberately fixed rather than heap allocated: claim and
-// completion callbacks can run at an IRQL where allocation is not safe.  They are
-// not connected to the live single-controller path yet; the following refactor
-// moves GIP/XAM state into the owning slot one subsystem at a time.
-// The existing proven path owns player 1.  At most three additional sessions may be
-// active, preserving the Xbox 360's four-controller limit.  Keep extra retired
-// storage so disconnect/reconnect never reuses a USB transfer structure that could
-// still be referenced by a late completion.
-#define GIP_MAX_SESSIONS 8
+// Slots are fixed rather than heap allocated because claim and completion callbacks
+// can run at an IRQL where allocation is unsafe. The primary slot is permanent and
+// owns the same extension, TRBs and buffers as every additional controller. Keeping
+// it separate from the retired-slot pool preserves the proven rule that a late USB
+// completion can never land in storage already reused by a different device.
+#define GIP_MAX_SESSIONS 32
 #define GIP_MAX_ADDITIONAL_ACTIVE 3
 struct GipSessionSlot {
 	bool                    reserved;
+	bool                    primary;
 	XboxInputControllerRuntime runtime;
 	HidControllerExtension  ext;
 	UsbTrb                  outTrb;
@@ -2302,8 +2295,54 @@ struct GipSessionSlot {
 	int                     inputsSeen;
 	int                     readErrors;
 	bool                    readLoopStopped;
+	uint16_t                vendorId;
+	uint16_t                productId;
+	volatile LONG           earlyPowerBusy;
+	deviceHandle*           earlyPowerHandle;
+	uint16_t                earlyPowerPacketSize;
+	bool                    guideOverlayOpen;
+	volatile LONG           powerAInitStage;
+	volatile LONG           powerAIdentifyComplete;
+	BYTE                    powerAInitBuf[64];
 };
 static GipSessionSlot g_gipSessions[GIP_MAX_SESSIONS];
+static GipSessionSlot* g_gipPrimarySession = &g_gipSessions[0];
+
+// Primary protocol code remains byte-for-byte familiar while its storage now has
+// one owner. These aliases are transitional names, not separate state. Callbacks
+// that recover the extension/TRB address therefore resolve to this permanent slot.
+#define g_gipExt                    (g_gipPrimarySession->ext)
+#define g_gipRuntime                (g_gipPrimarySession->runtime)
+#define g_gipVendorId               (g_gipPrimarySession->vendorId)
+#define g_gipProductId              (g_gipPrimarySession->productId)
+#define g_gipReadBuf                (g_gipPrimarySession->readBuf)
+#define g_gipPacketsSeen            (g_gipPrimarySession->packetsSeen)
+#define g_gipInputsSeen             (g_gipPrimarySession->inputsSeen)
+#define g_gipGuideOverlayOpen       (g_gipPrimarySession->guideOverlayOpen)
+#define g_gipOutTrb                 (g_gipPrimarySession->outTrb)
+#define g_gipOutBuf                 (g_gipPrimarySession->outBuf)
+#define g_gipOutBufIdx              (g_gipPrimarySession->outBufIndex)
+#define g_gipOutOpen                (g_gipPrimarySession->outOpen)
+#define g_gipEarlyPowerBuf          (g_gipPrimarySession->earlyPowerBuf)
+#define g_gipEarlyPowerBusy         (g_gipPrimarySession->earlyPowerBusy)
+#define g_gipEarlyPowerHandle       (g_gipPrimarySession->earlyPowerHandle)
+#define g_gipEarlyPowerPacketSize   (g_gipPrimarySession->earlyPowerPacketSize)
+#define g_gipRumbleBuf              (g_gipPrimarySession->rumbleBuf)
+#define g_gipRumbleInFlight         (g_gipPrimarySession->rumbleInFlight)
+#define g_gipRumblePending          (g_gipPrimarySession->rumblePending)
+#define g_gipRumbleRequestedLeft    (g_gipPrimarySession->rumbleRequestedLeft)
+#define g_gipRumbleRequestedRight   (g_gipPrimarySession->rumbleRequestedRight)
+#define g_gipRumbleLastLeft         (g_gipPrimarySession->rumbleLastLeft)
+#define g_gipRumbleLastRight        (g_gipPrimarySession->rumbleLastRight)
+#define g_gipRumbleHaveLast         (g_gipPrimarySession->rumbleHaveLast)
+#define g_gipSeq                    (g_gipPrimarySession->sequence)
+#define g_gipIdentifySent           (g_gipPrimarySession->identifySent)
+#define g_gipIdentifyReplySeen      (g_gipPrimarySession->identifyReplySeen)
+#define g_gipLastIdentifyTick       (g_gipPrimarySession->lastIdentifyTick)
+#define g_gipPoweredOn              (g_gipPrimarySession->poweredOn)
+#define g_powerAInitStage           (g_gipPrimarySession->powerAInitStage)
+#define g_powerAIdentifyComplete    (g_gipPrimarySession->powerAIdentifyComplete)
+#define g_powerAInitBuf             (g_gipPrimarySession->powerAInitBuf)
 
 static GipSessionSlot* GipSessionFromExtension(HidControllerExtension* ext) {
 	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
@@ -2321,10 +2360,39 @@ static GipSessionSlot* GipFindFreeSession() {
 	return 0;
 }
 
+static GipSessionSlot* GipReservePrimarySession(
+	const XboxInputControllerProfile* profile, deviceHandle* handle,
+	BYTE interfaceNumber, uint16_t vendorId, uint16_t productId) {
+	GipSessionSlot* session = GipFindFreeSession();
+	if (!session || !profile || !handle)
+		return 0;
+	memset(session, 0, sizeof(*session));
+	session->reserved = true;
+	session->primary = true;
+	session->sequence = 1;
+	session->earlyPowerPacketSize = GIP_READ_BUF_SIZE;
+	session->earlyPowerBuf[0] = GIP_CMD_POWER;
+	session->earlyPowerBuf[1] = GIP_OPT_INTERNAL;
+	session->earlyPowerBuf[2] = 0;
+	session->earlyPowerBuf[3] = 1;
+	session->earlyPowerBuf[4] = 0;
+	session->vendorId = vendorId;
+	session->productId = productId;
+	session->ext.deviceHandle = handle;
+	session->ext.interfaceNumber = interfaceNumber;
+	session->ext.deviceType = 0;
+	session->ext.interruptTrb.flags = 1;
+	XboxInputInitializeRuntime(&session->runtime, profile);
+	session->runtime.lifecycle = XBOXINPUT_SESSION_INITIALIZING;
+	g_gipPrimarySession = session;
+	return session;
+}
+
 static int GipActiveSessionCount() {
 	int count = 0;
 	for (int i = 0; i < GIP_MAX_SESSIONS; ++i)
-		if (g_gipSessions[i].reserved && g_gipSessions[i].ext.deviceHandle)
+		if (g_gipSessions[i].reserved && !g_gipSessions[i].primary &&
+			g_gipSessions[i].ext.deviceHandle)
 			++count;
 	return count;
 }
@@ -2348,10 +2416,11 @@ static bool GipControllerFromUser(uint8_t user, GipControllerRef* result) {
 	if (XboxInputRuntimeIsReady(&g_gipRuntime) &&
 		g_gipRuntime.playerIndex == user) {
 		result->kind = GIP_CONTROLLER_PRIMARY;
+		result->session = g_gipPrimarySession;
 		return true;
 	}
 	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-		if (g_gipSessions[i].reserved &&
+		if (g_gipSessions[i].reserved && !g_gipSessions[i].primary &&
 			XboxInputRuntimeIsReady(&g_gipSessions[i].runtime) &&
 			g_gipSessions[i].runtime.playerIndex == user) {
 			result->kind = GIP_CONTROLLER_ADDITIONAL;
@@ -2370,10 +2439,11 @@ static bool GipControllerFromContext(uint32_t context, GipControllerRef* result)
 	if (XboxInputRuntimeIsReady(&g_gipRuntime) &&
 		g_gipRuntime.deviceContext == context) {
 		result->kind = GIP_CONTROLLER_PRIMARY;
+		result->session = g_gipPrimarySession;
 		return true;
 	}
 	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-		if (g_gipSessions[i].reserved &&
+		if (g_gipSessions[i].reserved && !g_gipSessions[i].primary &&
 			XboxInputRuntimeIsReady(&g_gipSessions[i].runtime) &&
 			g_gipSessions[i].runtime.deviceContext == context) {
 			result->kind = GIP_CONTROLLER_ADDITIONAL;
@@ -2388,8 +2458,7 @@ static const XboxInputControllerProfile* GipControllerProfile(
 	const GipControllerRef* controller) {
 	if (!controller)
 		return 0;
-	return controller->kind == GIP_CONTROLLER_PRIMARY ? g_gipRuntime.profile :
-		(controller->session ? controller->session->runtime.profile : 0);
+	return controller->session ? controller->session->runtime.profile : 0;
 }
 
 // Sequence is adapter-global and never zero - refs/xone/bus/protocol.c:335-337.
@@ -2410,7 +2479,10 @@ static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMoto
 // either release the single-flight gate or immediately submit the newest cached
 // state.  A new XAM caller that wins the gate first simply owns the next transfer.
 static int32_t GipGamepadRumbleComplete(DWORD trbAddr, int32_t status) {
-	UNREFERENCED_PARAMETER(trbAddr);
+	// A retired session may complete after a reconnect. It owns different TRB
+	// storage and must never release the new session's single-flight gate.
+	if (trbAddr != (DWORD)&g_gipOutTrb)
+		return status;
 	InterlockedExchange(&g_gipRumbleInFlight, 0);
 	if (!g_gipOutOpen || !g_gipExt.deviceHandle)
 		return status;
@@ -2704,7 +2776,8 @@ static void GipUnregisterFromXam();
 static int GipPowerAQueueStage(LONG stage);
 
 static int32_t GipPowerAInitComplete(DWORD trbAddr, int32_t status) {
-	UNREFERENCED_PARAMETER(trbAddr);
+	if (trbAddr != (DWORD)&g_gipOutTrb)
+		return status;
 	LONG completed = g_powerAInitStage;
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 		XBOXINPUT_USB_POWERA_STAGE + completed, status);
@@ -3132,7 +3205,19 @@ static void GipRegisterWithXam() {
 	// collide on the same XAM index.
 	int idx = -1;
 	for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
-		if (!connectedControllers[i].controllerDriver) {
+		if (connectedControllers[i].controllerDriver)
+			continue;
+		const uint32_t context = 0x0000000010000005 + i;
+		bool used = false;
+		for (int j = 0; j < GIP_MAX_SESSIONS; ++j) {
+			if (g_gipSessions[j].reserved &&
+				XboxInputRuntimeIsReady(&g_gipSessions[j].runtime) &&
+				g_gipSessions[j].runtime.deviceContext == context) {
+				used = true;
+				break;
+			}
+		}
+		if (!used) {
 			idx = i;
 			break;
 		}
@@ -3866,7 +3951,8 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	// Bail out before touching anything if the device is already gone. This callback
 	// can still fire once after teardown with a completion that was already in flight;
 	// parsing or re-arming at that point is a use-after-free.
-	if (!ext || !ext->deviceHandle)
+	if (!ext || !ext->deviceHandle ||
+		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return 0;
 
 	// -----------------------------------------------------------------------
@@ -3959,7 +4045,8 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 }
 
 static int32_t GipStartPrimaryRead(HidControllerExtension* ext, uint16_t packetSize) {
-	if (!ext || !ext->deviceHandle)
+	if (!ext || !ext->deviceHandle ||
+		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return -1;
 #ifdef RIFFMASTER_NO_READ
 	UNREFERENCED_PARAMETER(packetSize);
@@ -4002,6 +4089,9 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	XboxInputSetDiagStage(50);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_SET_CONFIG_COMPLETE, status);
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 36);
+	if (!ext || !ext->deviceHandle ||
+		GipSessionFromExtension(ext) != g_gipPrimarySession)
+		return status;
 
 	RM_LOG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
 	if (status != 0)
@@ -4129,8 +4219,9 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	return GipStartPrimaryRead(ext, pkt);
 }
 
-// Additional controllers use their own callback chain and never touch the legacy
-// g_gipExt / g_gipReadBuf globals used by the proven single-controller path.
+// Additional controllers use the same session-owned storage model with a compact
+// callback chain. The primary path retains its proven protocol callbacks, but their
+// extension, TRBs and buffers are aliases into its current session slot.
 static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 4);
 	GipSessionSlot* session = GipSessionFromExtension(ext);
@@ -4308,10 +4399,27 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	const uint16_t detectedRevision = dd ? swap_endianness_16(dd->bcdDevice) : 0;
 	const XboxInputUsbInterfaceIdentity detectedInterface =
 		XboxInputInterfaceIdentity(id);
-	const XboxInputControllerProfile* detectedProfile = (dd && id)
-		? XboxInputMatchProfile(detectedVid, detectedPid, detectedRevision,
-			&detectedInterface)
-		: 0;
+	const XboxInputControllerProfile* profileCandidate = 0;
+	XboxInputProfileMatchResult profileResult;
+	if (!dd)
+		profileResult = XBOXINPUT_PROFILE_MISSING_DEVICE_DESCRIPTOR;
+	else if (!id)
+		profileResult = XBOXINPUT_PROFILE_MISSING_INTERFACE_DESCRIPTOR;
+	else
+		profileResult = XboxInputDiagnoseProfileMatch(detectedVid, detectedPid,
+			detectedRevision, &detectedInterface, &profileCandidate);
+	const XboxInputControllerProfile* detectedProfile =
+		profileResult == XBOXINPUT_PROFILE_MATCHED ? profileCandidate : 0;
+	XboxInputQueueLogEventEx(XBOXINPUT_LOG_PROFILE_DECISION,
+		((DWORD)detectedVid << 16) | detectedPid,
+		((DWORD)detectedRevision << 16) | (DWORD)profileResult,
+		((DWORD)detectedInterface.number << 24) |
+		((DWORD)detectedInterface.alternateSetting << 16) |
+		((DWORD)detectedInterface.endpointCount << 8) |
+		detectedInterface.interfaceClass,
+		((DWORD)detectedInterface.interfaceSubClass << 8) |
+		detectedInterface.interfaceProtocol,
+		(DWORD)status);
 
 	if (status != 0 && h && g_gipExt.deviceHandle && detectedProfile &&
 		detectedVid == MICROSOFT_VENDOR_ID &&
@@ -4349,13 +4457,18 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	if (s_claimedOnce && status != 0)
 		return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
 #endif
-	if (status != 0 && dd && id && h && g_gipClaimAttempts < GIP_CLAIM_MAX_ATTEMPTS) {
+	if (status != 0 && dd && id && h &&
+		g_gipClaimAttempts < GIP_CLAIM_MAX_ATTEMPTS && GipFindFreeSession()) {
 		uint16_t vid = detectedVid;
 		uint16_t pid = detectedPid;
 		const XboxInputControllerProfile* profile = detectedProfile;
 
 		if (profile &&
 			(!IsPowerA1414134(vid, pid) || !g_gipExt.deviceHandle)) {
+			GipSessionSlot* primarySession = GipReservePrimarySession(
+				profile, h, id->bInterfaceNumber, vid, pid);
+			if (!primarySession)
+				return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
 			XboxInputSetDiagStage(20);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CANDIDATE,
 				((DWORD)vid << 16) | pid);
@@ -4380,17 +4493,8 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 
 			// Statically allocated rather than new'd: we do not know the IRQL this
 			// callback runs at, and a failed allocation here would be a hang.
-			g_gipVendorId = vid;
-			g_gipProductId = pid;
-			XboxInputInitializeRuntime(&g_gipRuntime, profile);
-			g_gipRuntime.lifecycle = XBOXINPUT_SESSION_INITIALIZING;
 			InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 			InterlockedExchange(&g_powerAIdentifyComplete, 0);
-			memset(&g_gipExt, 0, sizeof(g_gipExt));
-			g_gipExt.deviceHandle = h;
-			g_gipExt.interfaceNumber = id->bInterfaceNumber;
-			g_gipExt.deviceType = 0;
-			g_gipExt.interruptTrb.flags = 1;
 
 			// -------------------------------------------------------------------
 			// THE CLAIM. `claimonly` proved these two lines alone are sufficient to
@@ -4572,7 +4676,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 	if (h) {
 		GipSessionSlot* session = 0;
 		for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-			if (g_gipSessions[i].reserved && g_gipSessions[i].ext.deviceHandle == h) {
+			if (g_gipSessions[i].reserved && !g_gipSessions[i].primary &&
+				g_gipSessions[i].ext.deviceHandle == h) {
 				session = &g_gipSessions[i];
 				break;
 			}
@@ -4945,14 +5050,7 @@ static NTSTATUS GipControllerReadState(const GipControllerRef* controller,
 	uint32_t* lastGuideTick = 0;
 	uint32_t* nextPacket = 0;
 	uint8_t userIndex = 0xFF;
-	if (controller->kind == GIP_CONTROLLER_PRIMARY) {
-		state = &g_gipRuntime.state;
-		guidePending = &g_gipRuntime.guidePending;
-		lastGuideTick = &g_gipRuntime.lastGuideTick;
-		nextPacket = &g_gipRuntime.packetNumber;
-		userIndex = g_gipRuntime.playerIndex;
-	}
-	else if (controller->kind == GIP_CONTROLLER_ADDITIONAL && controller->session) {
+	if (controller->session) {
 		state = &controller->session->runtime.state;
 		guidePending = &controller->session->runtime.guidePending;
 		lastGuideTick = &controller->session->runtime.lastGuideTick;
@@ -5111,26 +5209,66 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 	DWORD workerTitle = (DWORD)(ULONG_PTR)parameter;
 	typedef DWORD(*xam_get_current_title_id_t)(void);
+	bool notificationActive = false;
+	bool cancellationIssued = false;
+	DWORD notificationStarted = 0;
+	LONG pendingRemoved = 0;
+	BOOL savedShow = TRUE, savedMovie = TRUE, savedSound = TRUE, savedIptv = TRUE;
 	for (;;) {
 		if (!XamGetCurrentTitleIdPtr ||
 			((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)() != workerTitle)
 			break;
 
-		LONG removed = InterlockedExchange(&g_xboxInputRemovedUiMask, 0);
-		if (removed) {
-			BOOL show = TRUE, movie = TRUE, sound = TRUE, iptv = TRUE;
-			XNotifyUIGetOptions(&show, &movie, &sound, &iptv);
+		pendingRemoved |= InterlockedExchange(&g_xboxInputRemovedUiMask, 0);
+		if (pendingRemoved && !notificationActive && g_xboxInputDisconnectedUiMask != 0) {
+			XNotifyUIGetOptions(&savedShow, &savedMovie, &savedSound, &savedIptv);
 			// A reconnect warning must remain visible even when ordinary toast
 			// previews were disabled. Restore the user's preference afterwards.
-			XNotifyUISetOptions(TRUE, movie, sound, iptv);
+			XNotifyUISetOptions(TRUE, savedMovie, savedSound, savedIptv);
+			// Persistent priority gives us a supported cancellation path. The worker
+			// still enforces the former seven-second maximum below.
 			XNotifyQueueUI(XNOTIFYUI_TYPE_CONSOLEMESSAGE, XUSER_INDEX_ANY,
-				XNOTIFY_SYSTEM, L"Please reconnect controller", 0);
-			// XAM's normal banner includes entrance, dwell and exit phases. Restoring
-			// pfShow during any phase freezes the visual in place.
-			Sleep(7000);
-			XNotifyUISetOptions(show, movie, sound, iptv);
+				XNOTIFYUI_PRIORITY_PERSISTENT, L"Please reconnect controller", 0);
+			notificationStarted = GetTickCount();
+			notificationActive = true;
+			cancellationIssued = false;
+			pendingRemoved = 0;
+		}
+
+		if (notificationActive) {
+			const LONG disconnected = g_xboxInputDisconnectedUiMask;
+			const DWORD elapsed = (DWORD)(GetTickCount() - notificationStarted);
+			const bool timedOut = elapsed >= 7000;
+			if (!cancellationIssued && (disconnected == 0 || timedOut)) {
+				// The cancel request must use the same UI area/priority value as the
+				// notification it targets. Using DEFAULT here was ignored on 17559.
+				XNotifyQueueUI(XNOTIFYUI_TYPE_CANCELPERSISTENT, XUSER_INDEX_ANY,
+					XNOTIFYUI_PRIORITY_PERSISTENT, 0, 0);
+				XboxInputQueueLogEvent(XBOXINPUT_LOG_NOTIFICATION_CANCELLED,
+					timedOut ? 1 : 0, disconnected);
+				cancellationIssued = true;
+			}
+			// Even after requesting cancellation, do not restore pfShow until the
+			// original toast plus its exit animation must have expired. If 17559
+			// ignores cancellation this preserves the validated complete animation;
+			// restoring after two seconds was what froze the previous test build.
+			if (elapsed >= 9000) {
+				XNotifyUISetOptions(savedShow, savedMovie, savedSound, savedIptv);
+				notificationActive = false;
+				cancellationIssued = false;
+				if (g_xboxInputDisconnectedUiMask == 0)
+					pendingRemoved = 0;
+			}
 		}
 		Sleep(50);
+	}
+	if (notificationActive) {
+		XNotifyQueueUI(XNOTIFYUI_TYPE_CANCELPERSISTENT, XUSER_INDEX_ANY,
+			XNOTIFYUI_PRIORITY_PERSISTENT, 0, 0);
+		const DWORD elapsed = (DWORD)(GetTickCount() - notificationStarted);
+		if (elapsed < 9000)
+			Sleep(9000 - elapsed);
+		XNotifyUISetOptions(savedShow, savedMovie, savedSound, savedIptv);
 	}
 	if ((DWORD)g_xboxInputUiWorkerTitle == workerTitle)
 		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);

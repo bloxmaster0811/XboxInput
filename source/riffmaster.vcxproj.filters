@@ -6,6 +6,8 @@
     <ClCompile Include="hid_parser.cpp" />
     <ClCompile Include="mapping.cpp" />
     <ClCompile Include="controller_backend.cpp" />
+    <ClCompile Include="gip_gamepad_parser.cpp" />
+    <ClCompile Include="gamepad_mapping.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />
@@ -16,5 +18,7 @@
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="controller_backend.h" />
+    <ClInclude Include="gip_gamepad_parser.h" />
+    <ClInclude Include="gamepad_mapping.h" />
   </ItemGroup>
 </Project>

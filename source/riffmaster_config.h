@@ -1,8 +1,8 @@
 //
-// riffmaster.ini - optional user settings.
+// XboxInput.ini - optional user settings.
 //
 // The plugin needs NO config file. Every setting below has a built-in default matching
-// the behaviour verified on hardware, so a console with no riffmaster.ini behaves exactly
+// the behaviour verified on hardware, so a console with no XboxInput.ini behaves exactly
 // as the tested build does. The file exists so people can tune the things that genuinely
 // vary between guitars, consoles and game libraries - not as a required install step.
 //
@@ -25,8 +25,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "gamepad_mapping.h"
 
-#define RM_CFG_PATH            "HDD:\\riffmaster.ini"
+#define RM_CFG_PATH            "HDD:\\XboxInput.ini"
 #define RM_CFG_MAX_OVERRIDES   32
 
 struct RiffmasterConfig {
@@ -116,7 +117,7 @@ static void RmCfgWriteDefaults(const char* path) {
 
 	fputs(
 	"; ============================================================================\r\n"
-	";  riffmaster.ini - settings for riffmaster-rgh360\r\n"
+	";  XboxInput.ini - settings for XboxInput\r\n"
 	"; ============================================================================\r\n"
 	";\r\n"
 	";  This file is OPTIONAL. Every value below is already the built-in default, so\r\n"
@@ -243,6 +244,29 @@ static void RmCfgWriteDefaults(const char* path) {
 	"GuideCooldownMs = 1000\r\n"
 	"\r\n"
 	"; ----------------------------------------------------------------------------\r\n"
+	"; [GamepadMapping] - optional Xbox One/Series output customization\r\n"
+	"; ----------------------------------------------------------------------------\r\n"
+	"; Defaults below preserve the original controller exactly. Button values accept:\r\n"
+	"; DpadUp, DpadDown, DpadLeft, DpadRight, Start, Back, LeftThumb, RightThumb,\r\n"
+	"; LeftShoulder, RightShoulder, A, B, X, Y, or None.\r\n"
+	"; Stick deadzones are axial values from 0-32767. Trigger deadzones are 0-254.\r\n"
+	"; RumblePercent is clamped to 0-100. Changes require a hard reboot.\r\n"
+	"\r\n"
+	"[GamepadMapping]\r\n"
+	"A = A\r\nB = B\r\nX = X\r\nY = Y\r\n"
+	"DpadUp = DpadUp\r\nDpadDown = DpadDown\r\n"
+	"DpadLeft = DpadLeft\r\nDpadRight = DpadRight\r\n"
+	"Start = Start\r\nBack = Back\r\n"
+	"LeftThumb = LeftThumb\r\nRightThumb = RightThumb\r\n"
+	"LeftShoulder = LeftShoulder\r\nRightShoulder = RightShoulder\r\n"
+	"InvertLeftX = 0\r\nInvertLeftY = 0\r\n"
+	"InvertRightX = 0\r\nInvertRightY = 0\r\n"
+	"SwapSticks = 0\r\nSwapTriggers = 0\r\n"
+	"LeftStickDeadzone = 0\r\nRightStickDeadzone = 0\r\n"
+	"LeftTriggerDeadzone = 0\r\nRightTriggerDeadzone = 0\r\n"
+	"RumblePercent = 100\r\n"
+	"\r\n"
+	"; ----------------------------------------------------------------------------\r\n"
 	"; [Subtypes]  -  what kind of guitar each game is told it is\r\n"
 	"; ----------------------------------------------------------------------------\r\n"
 	";\r\n"
@@ -334,6 +358,20 @@ static bool RmCfgLoad(const char* path) {
 		else if (_stricmp(section, "Guide") == 0) {
 			if      (_stricmp(key, "GuideButton") == 0)     g_rmCfg.guideButton     = RmCfgBool(val);
 			else if (_stricmp(key, "GuideCooldownMs") == 0) g_rmCfg.guideCooldownMs = RmCfgClamp((int)RmCfgNumber(val, false), 100, 10000);
+		}
+		else if (_stricmp(section, "GamepadMapping") == 0) {
+			if      (_stricmp(key, "InvertLeftX") == 0)  g_xboxInputGamepadMapping.invertLeftX = RmCfgBool(val);
+			else if (_stricmp(key, "InvertLeftY") == 0)  g_xboxInputGamepadMapping.invertLeftY = RmCfgBool(val);
+			else if (_stricmp(key, "InvertRightX") == 0) g_xboxInputGamepadMapping.invertRightX = RmCfgBool(val);
+			else if (_stricmp(key, "InvertRightY") == 0) g_xboxInputGamepadMapping.invertRightY = RmCfgBool(val);
+			else if (_stricmp(key, "SwapSticks") == 0)   g_xboxInputGamepadMapping.swapSticks = RmCfgBool(val);
+			else if (_stricmp(key, "SwapTriggers") == 0) g_xboxInputGamepadMapping.swapTriggers = RmCfgBool(val);
+			else if (_stricmp(key, "LeftStickDeadzone") == 0) g_xboxInputGamepadMapping.leftStickDeadzone = (uint16_t)RmCfgClamp((int)RmCfgNumber(val, false), 0, 32767);
+			else if (_stricmp(key, "RightStickDeadzone") == 0) g_xboxInputGamepadMapping.rightStickDeadzone = (uint16_t)RmCfgClamp((int)RmCfgNumber(val, false), 0, 32767);
+			else if (_stricmp(key, "LeftTriggerDeadzone") == 0) g_xboxInputGamepadMapping.leftTriggerDeadzone = (uint8_t)RmCfgClamp((int)RmCfgNumber(val, false), 0, 254);
+			else if (_stricmp(key, "RightTriggerDeadzone") == 0) g_xboxInputGamepadMapping.rightTriggerDeadzone = (uint8_t)RmCfgClamp((int)RmCfgNumber(val, false), 0, 254);
+			else if (_stricmp(key, "RumblePercent") == 0) g_xboxInputGamepadMapping.rumblePercent = (uint8_t)RmCfgClamp((int)RmCfgNumber(val, false), 0, 100);
+			else XboxInputSetButtonMappingByName(&g_xboxInputGamepadMapping, key, val);
 		}
 		else if (_stricmp(section, "Subtypes") == 0) {
 			if (_stricmp(key, "Default") == 0) {
