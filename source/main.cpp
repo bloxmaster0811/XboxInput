@@ -170,6 +170,43 @@ struct XboxInputLogEvent {
 };
 static volatile LONG g_xboxInputLogEventSerial = 0;
 static XboxInputLogEvent g_xboxInputLogEvents[XBOXINPUT_LOG_EVENT_COUNT];
+static volatile LONG g_xboxInputRemovedUserMask = 0;
+
+// USB removal callbacks may run above PASSIVE_LEVEL. They may publish one bit here,
+// but must never enter XAM UI code directly; the logger/system thread drains it.
+static void XboxInputQueueRemovedControllerNotification(BYTE userIndex) {
+	if (userIndex >= 4)
+		return;
+	const LONG bit = (LONG)(1u << userIndex);
+	for (;;) {
+		LONG before = g_xboxInputRemovedUserMask;
+		if (InterlockedCompareExchange(&g_xboxInputRemovedUserMask,
+			before | bit, before) == before)
+			return;
+	}
+}
+
+static void XboxInputCancelRemovedControllerNotification(BYTE userIndex) {
+	if (userIndex >= 4)
+		return;
+	const LONG keepMask = ~(LONG)(1u << userIndex);
+	for (;;) {
+		LONG before = g_xboxInputRemovedUserMask;
+		if (InterlockedCompareExchange(&g_xboxInputRemovedUserMask,
+			before & keepMask, before) == before)
+			return;
+	}
+}
+
+static void XboxInputProcessControllerNotifications() {
+	LONG removed = InterlockedExchange(&g_xboxInputRemovedUserMask, 0);
+	for (BYTE user = 0; user < 4; ++user) {
+		if (removed & (1u << user)) {
+			XNotifyQueueUI(XNOTIFYUI_TYPE_REMOVEDGAMEPAD, user,
+				XNOTIFYUI_PRIORITY_HIGH, L"Please reconnect controller", 0);
+		}
+	}
+}
 
 static void XboxInputQueueLogEvent(DWORD type, DWORD value1, DWORD value2) {
 	LONG serial = InterlockedIncrement(&g_xboxInputLogEventSerial);
@@ -535,6 +572,7 @@ static DWORD XboxInputLogThread(PVOID) {
 	// DllMain.  Keep retrying forever: a late HDD/USB mount must still result in
 	// a log containing all initialization events retained in the ring.
 	for (;;) {
+		XboxInputProcessControllerNotifications();
 		FILE* file = XboxInputOpenLog(false, "w");
 		if (file) {
 			LONG pathIndex = g_xboxInputLogPathIndex;
@@ -573,6 +611,7 @@ static DWORD XboxInputLogThread(PVOID) {
 #endif
 	DWORD lastMirrorTick = 0;
 	for (;;) {
+		XboxInputProcessControllerNotifications();
 #ifdef XBOXINPUT_RESTORE_WGC_MATCH
 		if (!wroteWgcPatchState) {
 			FILE* file = XboxInputOpenLog(false, "a");
@@ -2116,7 +2155,7 @@ static int g_gipClaimAttempts = 0;
 static HidControllerExtension g_gipExt;
 static uint16_t g_gipVendorId = 0;
 static uint16_t g_gipProductId = 0;
-static const XboxInputControllerProfile* g_gipProfile = 0;
+static XboxInputControllerRuntime g_gipRuntime;
 
 // Read buffer for the GIP interrupt IN endpoint. wMaxPacketSize is 64
 // (docs/gip_riffmaster.md section 2, read from the descriptor, not assumed).
@@ -2125,10 +2164,6 @@ static const XboxInputControllerProfile* g_gipProfile = 0;
 static BYTE g_gipReadBuf[GIP_READ_BUF_SIZE];
 static int  g_gipPacketsSeen = 0;
 static int  g_gipInputsSeen = 0;
-static GipGamepadState g_gipState;
-static bool g_gipReady = false;
-static bool g_gipGuideDown = false;
-static bool g_gipGuidePending = false;
 static bool g_gipGuideOverlayOpen = false;
 
 // ---- host -> device side ----------------------------------------------------
@@ -2221,7 +2256,7 @@ static bool     g_gipHostFinishReady = false;
 #define GIP_MAX_ADDITIONAL_ACTIVE 3
 struct GipSessionSlot {
 	bool                    reserved;
-	const XboxInputControllerProfile* profile;
+	XboxInputControllerRuntime runtime;
 	HidControllerExtension  ext;
 	UsbTrb                  outTrb;
 	BYTE                    earlyPowerBuf[5];
@@ -2242,14 +2277,6 @@ struct GipSessionSlot {
 	bool                    identifyReplySeen;
 	DWORD                   lastIdentifyTick;
 	bool                    poweredOn;
-	bool                    ready;
-	GipGamepadState         state;
-	bool                    guideDown;
-	bool                    guidePending;
-	DWORD                   lastGuideTick;
-	uint8_t                 userIndex;
-	uint32_t                deviceContext;
-	DWORD                   packetNumber;
 	int                     packetsSeen;
 	int                     inputsSeen;
 	int                     readErrors;
@@ -2281,22 +2308,67 @@ static int GipActiveSessionCount() {
 	return count;
 }
 
-static GipSessionSlot* GipSessionFromUser(uint8_t user) {
-	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-		if (g_gipSessions[i].reserved && g_gipSessions[i].ready &&
-			g_gipSessions[i].userIndex == user)
-			return &g_gipSessions[i];
+enum GipControllerKind {
+	GIP_CONTROLLER_NONE = 0,
+	GIP_CONTROLLER_PRIMARY,
+	GIP_CONTROLLER_ADDITIONAL,
+};
+
+struct GipControllerRef {
+	GipControllerKind kind;
+	GipSessionSlot* session;
+};
+
+static bool GipControllerFromUser(uint8_t user, GipControllerRef* result) {
+	if (!result)
+		return false;
+	result->kind = GIP_CONTROLLER_NONE;
+	result->session = 0;
+	if (XboxInputRuntimeIsReady(&g_gipRuntime) &&
+		g_gipRuntime.playerIndex == user) {
+		result->kind = GIP_CONTROLLER_PRIMARY;
+		return true;
 	}
-	return 0;
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (g_gipSessions[i].reserved &&
+			XboxInputRuntimeIsReady(&g_gipSessions[i].runtime) &&
+			g_gipSessions[i].runtime.playerIndex == user) {
+			result->kind = GIP_CONTROLLER_ADDITIONAL;
+			result->session = &g_gipSessions[i];
+			return true;
+		}
+	}
+	return false;
 }
 
-static GipSessionSlot* GipSessionFromContext(uint32_t context) {
-	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-		if (g_gipSessions[i].reserved && g_gipSessions[i].ready &&
-			g_gipSessions[i].deviceContext == context)
-			return &g_gipSessions[i];
+static bool GipControllerFromContext(uint32_t context, GipControllerRef* result) {
+	if (!result)
+		return false;
+	result->kind = GIP_CONTROLLER_NONE;
+	result->session = 0;
+	if (XboxInputRuntimeIsReady(&g_gipRuntime) &&
+		g_gipRuntime.deviceContext == context) {
+		result->kind = GIP_CONTROLLER_PRIMARY;
+		return true;
 	}
-	return 0;
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if (g_gipSessions[i].reserved &&
+			XboxInputRuntimeIsReady(&g_gipSessions[i].runtime) &&
+			g_gipSessions[i].runtime.deviceContext == context) {
+			result->kind = GIP_CONTROLLER_ADDITIONAL;
+			result->session = &g_gipSessions[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+static const XboxInputControllerProfile* GipControllerProfile(
+	const GipControllerRef* controller) {
+	if (!controller)
+		return 0;
+	return controller->kind == GIP_CONTROLLER_PRIMARY ? g_gipRuntime.profile :
+		(controller->session ? controller->session->runtime.profile : 0);
 }
 
 // Sequence is adapter-global and never zero - refs/xone/bus/protocol.c:335-337.
@@ -2637,8 +2709,8 @@ static int32_t GipPowerAInitComplete(DWORD trbAddr, int32_t status) {
 
 	if (completed == POWERA_INIT_RUMBLE_STOP) {
 		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_COMPLETE);
-		if (!g_gipReady) {
-			g_gipReady = true;
+		if (!XboxInputRuntimeIsReady(&g_gipRuntime)) {
+			XboxInputRuntimeSetReady(&g_gipRuntime, true);
 			g_gipClaimAttempts = 0;
 			GipRegisterWithXam();
 		}
@@ -2836,9 +2908,6 @@ static void GipRsaSelfTest() {
 // our GIP state. Keeping a separate identity means our branches can run first and the
 // upstream paths are left completely untouched for real HID pads.
 //
-static uint8_t  g_gipUserIndex = 0xFF;
-static uint32_t g_gipDeviceContext = 0;
-static DWORD    g_gipPacketNumber = 0;
 static int      g_gipCapsLogged = 0;
 static int      g_gipCaps2Logged = 0;
 
@@ -3039,7 +3108,7 @@ static void GipRegisterWithXam() {
 	RM_LOG("RIFFMASTER: XAM registration SKIPPED (noxam variant)\r\n");
 	return;
 #endif
-	if (g_gipUserIndex != 0xFF)
+	if (g_gipRuntime.playerIndex != 0xFF)
 		return;                       // already registered
 
 	// Pick a slot hiddriver360 is not using so a real pad and the guitar cannot
@@ -3060,8 +3129,10 @@ static void GipRegisterWithXam() {
 	uint32_t context = 0x0000000010000005 + idx;
 	XamUserBindDeviceCallback(0xa7553952 + idx, context, 0, false, &userIndex);
 
-	g_gipUserIndex = userIndex;
-	g_gipDeviceContext = context;
+	g_gipRuntime.playerIndex = userIndex;
+	g_gipRuntime.deviceContext = context;
+	XboxInputRuntimeSetReady(&g_gipRuntime, userIndex != 0xFF);
+	XboxInputCancelRemovedControllerNotification(userIndex);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_XAM_REGISTER,
 		((DWORD)userIndex << 24) | (context & 0x00FFFFFF));
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, userIndex, context);
@@ -3070,35 +3141,38 @@ static void GipRegisterWithXam() {
 }
 
 static void GipUnregisterFromXam() {
-	g_gipReady = false;
-	if (g_gipUserIndex == 0xFF)
+	XboxInputRuntimeSetReady(&g_gipRuntime, false);
+	if (g_gipRuntime.playerIndex == 0xFF)
 		return;
-	int idx = (int)(g_gipDeviceContext - 0x0000000010000005);
-	XamUserBindDeviceCallback(0xa7553952 + idx, g_gipDeviceContext, 0, true, 0);
+	int idx = (int)(g_gipRuntime.deviceContext - 0x0000000010000005);
+	XamUserBindDeviceCallback(0xa7553952 + idx,
+		g_gipRuntime.deviceContext, 0, true, 0);
 	// RM_DBG, not RM_LOG: only caller is UsbdRemoveDeviceCompleteHook, and DbgPrint
 	// inside the USB removal completion is the freeze suspect. See the banner there.
 	RM_DBG("RIFFMASTER: removed virtual guitar from XAM\r\n");
-	g_gipUserIndex = 0xFF;
-	g_gipDeviceContext = 0;
+	g_gipRuntime.playerIndex = 0xFF;
+	g_gipRuntime.deviceContext = 0;
 }
 
 static void GipSessionRegisterWithXam(GipSessionSlot* session) {
-	if (!session || session->userIndex != 0xFF)
+	if (!session || session->runtime.playerIndex != 0xFF)
 		return;
 	for (int idx = 0; idx < 4; ++idx) {
 		uint32_t context = 0x10000005 + idx;
-		bool used = (context == g_gipDeviceContext);
+		bool used = (context == g_gipRuntime.deviceContext);
 		for (int i = 0; i < GIP_MAX_SESSIONS; ++i)
-			if (g_gipSessions[i].reserved && g_gipSessions[i].deviceContext == context)
+			if (g_gipSessions[i].reserved &&
+				g_gipSessions[i].runtime.deviceContext == context)
 				used = true;
 		if (used || connectedControllers[idx].controllerDriver)
 			continue;
 		uint8_t user = 0xFF;
 		XamUserBindDeviceCallback(0xa7553952 + idx, context, 0, false, &user);
-		session->userIndex = user;
-		session->deviceContext = context;
-		session->ready = (user != 0xFF);
-		if (session->ready)
+		session->runtime.playerIndex = user;
+		session->runtime.deviceContext = context;
+		XboxInputRuntimeSetReady(&session->runtime, user != 0xFF);
+		XboxInputCancelRemovedControllerNotification(user);
+		if (XboxInputRuntimeIsReady(&session->runtime))
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, user, context);
 		return;
 	}
@@ -3456,8 +3530,8 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 				// Standard Microsoft gamepads stream input after IDENTIFY/POWER; unlike
 				// the RiffMaster dongle they do not require the guitar RSA exchange.
-				if (!g_gipReady) {
-					g_gipReady = true;
+				if (!XboxInputRuntimeIsReady(&g_gipRuntime)) {
+					XboxInputRuntimeSetReady(&g_gipRuntime, true);
 					// Gamepads skip the guitar authentication sequence. Reaching this
 					// point is therefore a successful session and may refill the safe
 					// reconnect budget after a sleep/wake bounce.
@@ -3621,24 +3695,25 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				// Ignore any repeated DOWN packet while the physical button remains
 				// held. Otherwise it can be interpreted as a second dashboard press,
 				// immediately closing the Guide that the first one opened.
-				if (down && !g_gipGuideDown)
-					g_gipGuidePending = true;
-				if (down && !g_gipGuideDown)
+				if (down && !g_gipRuntime.guideDown)
+					g_gipRuntime.guidePending = true;
+				if (down && !g_gipRuntime.guideDown)
 					g_gipGuideOverlayOpen = !g_gipGuideOverlayOpen;
-				g_gipGuideDown = down;
+				g_gipRuntime.guideDown = down;
 				RM_DBG("RIFFMASTER: GIP GUIDE %s\r\n", payload[0] ? "DOWN" : "UP");
 			}
 			break;
 
 		case GIP_CMD_INPUT:
-			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &g_gipState)) {
+			if (GipParseGamepadInput(payload, (int)hdr.packetLength,
+				&g_gipRuntime.state)) {
 				// A controller can retain its GIP session across a quick USB bounce.
 				// In that case it resumes streaming INPUT without a new ANNOUNCE or
 				// IDENTIFY. A valid parsed report on our claimed, supported interface
 				// is enough to restore the XAM slot; otherwise input is lost at user 255.
-				if (!g_gipReady && g_gipExt.deviceHandle &&
+				if (!XboxInputRuntimeIsReady(&g_gipRuntime) && g_gipExt.deviceHandle &&
 					IsSupportedGipGamepad(g_gipVendorId, g_gipProductId)) {
-					g_gipReady = true;
+					XboxInputRuntimeSetReady(&g_gipRuntime, true);
 					g_gipPoweredOn = true;
 					g_gipClaimAttempts = 0;
 					XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
@@ -3647,12 +3722,13 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				}
 				if (g_gipInputsSeen == 0)
 					XboxInputQueueLogEvent(XBOXINPUT_LOG_FIRST_INPUT,
-						g_gipUserIndex == 0xFF ? 0xFF : g_gipUserIndex, hdr.sequence);
+						g_gipRuntime.playerIndex == 0xFF ? 0xFF :
+						g_gipRuntime.playerIndex, hdr.sequence);
 				g_gipInputsSeen++;
 				// Rate-limited: these arrive at ~40 Hz and would flood the log.
 				if (g_gipInputsSeen <= 3 || (g_gipInputsSeen % 400) == 0)
 					RM_DBG("XBOXINPUT: GIP INPUT #%d btn=%04X\r\n",
-						g_gipInputsSeen, g_gipState.buttons);
+						g_gipInputsSeen, g_gipRuntime.state.buttons);
 			}
 			break;
 
@@ -3735,14 +3811,16 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 		case GIP_CMD_VIRTUAL_KEY:
 			if (hdr.packetLength >= 2 && payload[1] == GIP_VKEY_GUIDE) {
 				bool down = payload[0] != 0;
-				if (down && !session->guideDown)
-					session->guidePending = true;
-				session->guideDown = down;
+				if (down && !session->runtime.guideDown)
+					session->runtime.guidePending = true;
+				session->runtime.guideDown = down;
 			}
 			break;
 		case GIP_CMD_INPUT:
-			if (GipParseGamepadInput(payload, (int)hdr.packetLength, &session->state)) {
-				if (!session->ready && session->ext.deviceHandle) {
+			if (GipParseGamepadInput(payload, (int)hdr.packetLength,
+				&session->runtime.state)) {
+				if (!XboxInputRuntimeIsReady(&session->runtime) &&
+					session->ext.deviceHandle) {
 					session->poweredOn = true;
 					XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 						XBOXINPUT_USB_RESUMED_FROM_INPUT, hdr.sequence);
@@ -4127,8 +4205,8 @@ static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
 		return -1;
 	memset(session, 0, sizeof(*session));
 	session->reserved = true;
-	session->profile = profile;
-	session->userIndex = 0xFF;
+	XboxInputInitializeRuntime(&session->runtime, profile);
+	session->runtime.lifecycle = XBOXINPUT_SESSION_INITIALIZING;
 	session->sequence = 1;
 	session->ext.deviceHandle = h;
 	session->ext.interfaceNumber = interfaceNumber;
@@ -4290,7 +4368,8 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// callback runs at, and a failed allocation here would be a hang.
 			g_gipVendorId = vid;
 			g_gipProductId = pid;
-			g_gipProfile = profile;
+			XboxInputInitializeRuntime(&g_gipRuntime, profile);
+			g_gipRuntime.lifecycle = XBOXINPUT_SESSION_INITIALIZING;
 			InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 			InterlockedExchange(&g_powerAIdentifyComplete, 0);
 			memset(&g_gipExt, 0, sizeof(g_gipExt));
@@ -4485,22 +4564,23 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			}
 		}
 		if (session) {
-			const uint8_t removedUser = session->userIndex;
+			const uint8_t removedUser = session->runtime.playerIndex;
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
 				removedUser);
-			session->ready = false;
-			session->guidePending = false;
+			XboxInputRuntimeSetReady(&session->runtime, false);
+			session->runtime.guidePending = false;
 			session->outOpen = false;
 			session->ext.deviceHandle = 0;
 			session->ext.cleanupDone = 1;
 			h->driver = 0;
-			if (session->userIndex != 0xFF) {
-				int idx = (int)(session->deviceContext - 0x10000005);
+			if (session->runtime.playerIndex != 0xFF) {
+				int idx = (int)(session->runtime.deviceContext - 0x10000005);
 				XamUserBindDeviceCallback(0xa7553952 + idx,
-					session->deviceContext, 0, true, 0);
-				session->userIndex = 0xFF;
-				session->deviceContext = 0;
+					session->runtime.deviceContext, 0, true, 0);
 			}
+			XboxInputRetireRuntime(&session->runtime);
+			if (removedUser != 0xFF)
+				XboxInputQueueRemovedControllerNotification(removedUser);
 			if (removedUser != 0xFF)
 				XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_REMOVED, removedUser, 0);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_COMPLETE,
@@ -4524,7 +4604,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 	// ---------------------------------------------------------------------
 	if (h && h == g_gipExt.deviceHandle) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
-			g_gipUserIndex);
+			g_gipRuntime.playerIndex);
 		RM_DBG("RIFFMASTER: *** device removed - tearing down GIP state ***\r\n");
 
 		// 0. Stop presenting as a live controller IMMEDIATELY.
@@ -4544,7 +4624,6 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		g_gipExt.deviceHandle = 0;
 		g_gipVendorId = 0;
 		g_gipProductId = 0;
-		g_gipProfile = 0;
 		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 		InterlockedExchange(&g_powerAIdentifyComplete, 0);
 		g_gipOutOpen = false;
@@ -4605,8 +4684,11 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		// 4. Release the XAM virtual controller.
 		//    This was MISSING: the guitar stayed registered after the device was
 		//    gone, so XAM kept a controller bound to a dead device indefinitely.
-		const uint8_t removedUser = g_gipUserIndex;
+		const uint8_t removedUser = g_gipRuntime.playerIndex;
 		GipUnregisterFromXam();
+		XboxInputRetireRuntime(&g_gipRuntime);
+		if (removedUser != 0xFF)
+			XboxInputQueueRemovedControllerNotification(removedUser);
 		if (removedUser != 0xFF)
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_REMOVED, removedUser, 0);
 
@@ -4617,9 +4699,6 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			g_gipLastIdentifyTick = 0;
 			g_gipPoweredOn = false;
 		g_gipAuthStarted = true;
-		g_gipReady = false;
-		g_gipGuideDown = false;
-		g_gipGuidePending = false;
 		g_gipGuideOverlayOpen = false;
 		g_gipChunkTotal = 0;
 		g_gipAuthChunkTotal = 0;
@@ -4635,7 +4714,6 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		g_gipReadLoopStopped = false;
 		g_gipCapsLogged = 0;
 		g_gipCaps2Logged = 0;
-		memset(&g_gipState, 0, sizeof(g_gipState));
 
 		RM_DBG("RIFFMASTER: teardown done, ready for replug\r\n");
 
@@ -4830,25 +4908,72 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 }
 
+static void GipControllerSendRumble(const GipControllerRef* controller,
+	BYTE left, BYTE right) {
+	if (!controller)
+		return;
+	const XboxInputControllerProfile* profile = GipControllerProfile(controller);
+	if (!profile || !(profile->capabilities & XBOXINPUT_CAP_RUMBLE))
+		return;
+	if (controller->kind == GIP_CONTROLLER_PRIMARY)
+		GipSendGamepadRumble(g_gipExt.deviceHandle, left, right);
+	else if (controller->kind == GIP_CONTROLLER_ADDITIONAL && controller->session)
+		GipSessionSendRumble(controller->session, left, right);
+}
+
+static NTSTATUS GipControllerReadState(const GipControllerRef* controller,
+	PDWORD packetNumber, PXINPUT_GAMEPAD inputData, PBOOL unk) {
+	if (!controller || !inputData)
+		return ERROR_INVALID_PARAMETER;
+
+	GipGamepadState* state = 0;
+	bool* guidePending = 0;
+	uint32_t* lastGuideTick = 0;
+	uint32_t* nextPacket = 0;
+	uint8_t userIndex = 0xFF;
+	if (controller->kind == GIP_CONTROLLER_PRIMARY) {
+		state = &g_gipRuntime.state;
+		guidePending = &g_gipRuntime.guidePending;
+		lastGuideTick = &g_gipRuntime.lastGuideTick;
+		nextPacket = &g_gipRuntime.packetNumber;
+		userIndex = g_gipRuntime.playerIndex;
+	}
+	else if (controller->kind == GIP_CONTROLLER_ADDITIONAL && controller->session) {
+		state = &controller->session->runtime.state;
+		guidePending = &controller->session->runtime.guidePending;
+		lastGuideTick = &controller->session->runtime.lastGuideTick;
+		nextPacket = &controller->session->runtime.packetNumber;
+		userIndex = controller->session->runtime.playerIndex;
+	}
+	if (!state || !guidePending || !lastGuideTick || !nextPacket)
+		return ERROR_DEVICE_NOT_CONNECTED;
+
+	GipGamepadToXInput(state, inputData);
+	if (*guidePending && g_rmCfg.guideButton) {
+		*guidePending = false;
+		DWORD now = GetTickCount();
+		if (now - *lastGuideTick >= (DWORD)g_rmCfg.guideCooldownMs) {
+			*lastGuideTick = now;
+			XamInputSendXenonButtonPress(userIndex);
+		}
+	}
+	if (packetNumber)
+		*packetNumber = ++(*nextPacket);
+	if (unk)
+		*unk = FALSE;
+	return STATUS_SUCCESS;
+}
+
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
 	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, vibration);
 
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
-	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
-	if (multiSession) {
+	GipControllerRef controller;
+	if (GipControllerFromUser((uint8_t)user, &controller)) {
 		const BYTE left = vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0;
 		const BYTE right = vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0;
-		GipSessionSendRumble(multiSession, left, right);
-		return ERROR_SUCCESS;
-	}
-
-	// XAM passes the 16-bit 360 motor speeds in XINPUT_VIBRATION. Convert them
-	// to the gamepad's 8-bit direct-motor values.
-	if (g_gipReady && g_gipUserIndex != 0xFF && user == g_gipUserIndex) {
-		const BYTE left = vibration ? (BYTE)(vibration->wLeftMotorSpeed >> 8) : 0;
-		const BYTE right = vibration ? (BYTE)(vibration->wRightMotorSpeed >> 8) : 0;
-		GipSendGamepadRumble(g_gipExt.deviceHandle, left, right);
+		GipControllerSendRumble(&controller, left, right);
 		return ERROR_SUCCESS;
 	}
 
@@ -4877,21 +5002,8 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 
 	if (!capabilities)
 		return status;
-	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
-	if (multiSession) {
-		GipFillGuitarCaps(capabilities->Type, capabilities->SubType,
-			capabilities->Flags, capabilities->Gamepad);
-		capabilities->Vibration.wLeftMotorSpeed = 0;
-		capabilities->Vibration.wRightMotorSpeed = 0;
-		return ERROR_SUCCESS;
-	}
-
-	// ---- RiffMaster: report a GUITAR, not a gamepad ----------------------
-	// This runs before hiddriver360's own path so real HID pads keep reporting
-	// XINPUT_DEVSUBTYPE_GAMEPAD. rb1wiidrums replaced the SubType unconditionally,
-	// which would have made every controller claim to be an instrument
-	// (docs/rb1wii_analysis.md hunk 5).
-	if (g_gipUserIndex != 0xFF && user == g_gipUserIndex && g_gipReady) {
+	GipControllerRef controller;
+	if (GipControllerFromUser((uint8_t)user, &controller)) {
 		// Rate limited: the dash/game polls capabilities many times per second, and
 		// logging every call floods xbdm and hangs the console.
 		if (g_gipCapsLogged < 3) {
@@ -4963,15 +5075,8 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 		user = 0;
 	if (!caps)
 		return status;
-	GipSessionSlot* multiSession = GipSessionFromUser((uint8_t)user);
-	if (multiSession) {
-		GipFillGuitarCaps(caps->Type, caps->SubType, caps->Flags, caps->Gamepad);
-		caps->Vibration.wLeftMotorSpeed = 0;
-		caps->Vibration.wRightMotorSpeed = 0;
-		return ERROR_SUCCESS;
-	}
-
-	if (g_gipUserIndex != 0xFF && user == g_gipUserIndex && g_gipReady) {
+	GipControllerRef controller;
+	if (GipControllerFromUser((uint8_t)user, &controller)) {
 		if (g_gipCaps2Logged < 3) {
 			g_gipCaps2Logged++;
 			RM_DBG("RIFFMASTER: XamInputGetCapabilities(user=%d flags=%d) -> GUITAR\r\n",
@@ -4986,54 +5091,9 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 }
 
 NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXINPUT_GAMEPAD pInputData, PBOOL unk) {
-	GipSessionSlot* multiSession = GipSessionFromContext(dwDeviceContext);
-	if (multiSession) {
-		if (!pInputData)
-			return ERROR_INVALID_PARAMETER;
-		GipGamepadToXInput(&multiSession->state, pInputData);
-		if (multiSession->guidePending && g_rmCfg.guideButton) {
-			multiSession->guidePending = false;
-			DWORD now = GetTickCount();
-			if (now - multiSession->lastGuideTick >= (DWORD)g_rmCfg.guideCooldownMs) {
-				multiSession->lastGuideTick = now;
-				XamInputSendXenonButtonPress(multiSession->userIndex);
-			}
-		}
-		if (pdwPacketNumber)
-			*pdwPacketNumber = ++multiSession->packetNumber;
-		if (unk)
-			*unk = FALSE;
-		return STATUS_SUCCESS;
-	}
-	// ---- RiffMaster: synthesize a 360 guitar report ----------------------
-	// Checked before hiddriver360's own lookup: our state comes from the GIP parser,
-	// not from its HID ButtonsReport.
-	if (g_gipUserIndex != 0xFF && g_gipReady &&
-		dwDeviceContext == g_gipDeviceContext) {
-		if (!pInputData)
-			return ERROR_INVALID_PARAMETER;
-
-		GipGamepadToXInput(&g_gipState, pInputData);
-
-		// Guide arrives as a separate GIP 0x07 packet, not in the gamepad
-		// report. Retail 17559 masks the extended Guide bit for virtual devices,
-		// so use XAM's supported one-shot Guide event.
-		if (g_gipGuidePending && g_rmCfg.guideButton) {
-			g_gipGuidePending = false;
-			static DWORD lastGuide = 0;
-			DWORD now = GetTickCount();
-			if (now - lastGuide >= (DWORD)g_rmCfg.guideCooldownMs) {
-				lastGuide = now;
-				XamInputSendXenonButtonPress(g_gipUserIndex);
-			}
-		}
-
-		if (pdwPacketNumber)
-			*pdwPacketNumber = ++g_gipPacketNumber;
-		if (unk)
-			*unk = FALSE;
-		return STATUS_SUCCESS;
-	}
+	GipControllerRef controller;
+	if (GipControllerFromContext(dwDeviceContext, &controller))
+		return GipControllerReadState(&controller, pdwPacketNumber, pInputData, unk);
 
 	if (dwDeviceContext >= 0x0000000010000005) {
 		if (!pInputData)

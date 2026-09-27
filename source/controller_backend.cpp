@@ -132,3 +132,37 @@ void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping) {
 		mapping->buttonTargets[i] = kDefaultButtonTargets[i];
 	mapping->rumblePercent = 100;
 }
+
+void XboxInputInitializeRuntime(XboxInputControllerRuntime* runtime,
+	const XboxInputControllerProfile* profile) {
+	if (!runtime)
+		return;
+	memset(runtime, 0, sizeof(*runtime));
+	runtime->lifecycle = XBOXINPUT_SESSION_CLAIMING;
+	runtime->profile = profile;
+	runtime->playerIndex = 0xFF;
+}
+
+bool XboxInputRuntimeIsReady(const XboxInputControllerRuntime* runtime) {
+	return runtime && runtime->lifecycle == XBOXINPUT_SESSION_READY &&
+		runtime->playerIndex != 0xFF;
+}
+
+void XboxInputRuntimeSetReady(XboxInputControllerRuntime* runtime, bool ready) {
+	if (!runtime)
+		return;
+	runtime->lifecycle = ready ? XBOXINPUT_SESSION_READY :
+		XBOXINPUT_SESSION_INITIALIZING;
+}
+
+void XboxInputRetireRuntime(XboxInputControllerRuntime* runtime) {
+	if (!runtime)
+		return;
+	runtime->lifecycle = XBOXINPUT_SESSION_RETIRED;
+	runtime->playerIndex = 0xFF;
+	runtime->deviceContext = 0;
+	runtime->guideDown = false;
+	runtime->guidePending = false;
+	runtime->stopping = true;
+	XboxInputResetNormalizedState(&runtime->state);
+}

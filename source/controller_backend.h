@@ -105,6 +105,9 @@ struct XboxInputControllerRuntime {
 	uint8_t playerIndex;
 	uint32_t deviceContext;
 	uint32_t packetNumber;
+	bool guideDown;
+	bool guidePending;
+	uint32_t lastGuideTick;
 	bool stopping;
 };
 
@@ -141,4 +144,8 @@ const char* XboxInputInitProfileName(XboxInputInitProfile initProfile);
 
 void XboxInputResetNormalizedState(XboxInputNormalizedState* state);
 void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping);
-
+void XboxInputInitializeRuntime(XboxInputControllerRuntime* runtime,
+	const XboxInputControllerProfile* profile);
+bool XboxInputRuntimeIsReady(const XboxInputControllerRuntime* runtime);
+void XboxInputRuntimeSetReady(XboxInputControllerRuntime* runtime, bool ready);
+void XboxInputRetireRuntime(XboxInputControllerRuntime* runtime);
