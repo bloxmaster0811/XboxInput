@@ -1,10 +1,18 @@
 Release Retail/
 Debug/
+artifacts/
+dist/
+*.xex
 *.obj
 *.pdb
 *.xdb
+*.sdf
+*.suo
+*.user
 *.tlog
 *.lastbuildstate
 *.log
 .vs/
 ipch/
+XboxInput.ini
+XboxInput.reload

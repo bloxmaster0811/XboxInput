@@ -9,7 +9,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{2BAA662E-BD8B-45A5-B465-4498C2FB2775}</ProjectGuid>
     <Keyword>Xbox360Proj</Keyword>
-    <ProjectName>hiddriver</ProjectName>
+    <ProjectName>XboxInput</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
@@ -31,8 +31,8 @@
     <LinkIncremental>false</LinkIncremental>
     <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
     <RemoteRoot>HDD:\</RemoteRoot>
-    <ImageXexOutput>$(OutDir)riffmaster.xex</ImageXexOutput>
-    <OutputFile>$(OutDir)riffmaster$(TargetExt)</OutputFile>
+    <ImageXexOutput>$(OutDir)XboxInput.xex</ImageXexOutput>
+    <OutputFile>$(OutDir)XboxInput$(TargetExt)</OutputFile>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
     <ClCompile>
@@ -51,7 +51,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;RIFFMASTER_GIP_ONLY;RIFFMASTER_NO_USB_RESET;RIFFMASTER_NO_NOTIFY_PATCH;RIFFMASTER_KEEP_DRIVER;$(XboxInputCompatProbe);$(XboxInputLoadNotify);$(XboxInputWgcWorkaround);$(XboxInputDisableFileLog);$(XboxInputNullLogger)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_XBOX;LTCG;XBOXINPUT_GIP_ONLY;XBOXINPUT_NO_USB_RESET;XBOXINPUT_NO_NOTIFY_PATCH;XBOXINPUT_KEEP_DRIVER;$(XboxInputCompatProbe);$(XboxInputLoadNotify);$(XboxInputWgcWorkaround);$(XboxInputDisableFileLog);$(XboxInputNullLogger)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -69,7 +69,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <SetChecksum>true</SetChecksum>
       <AdditionalOptions>/dll %(AdditionalOptions)</AdditionalOptions>
-      <ProgramDatabaseFile>$(ProjectDir)$(Configuration)hiddriver.pdb</ProgramDatabaseFile>
+      <ProgramDatabaseFile>$(ProjectDir)$(Configuration)XboxInput.pdb</ProgramDatabaseFile>
       <EntryPointSymbol>
       </EntryPointSymbol>
     </Link>
@@ -93,10 +93,8 @@
     <ClInclude Include="hid_parser.h" />
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
-    <ClInclude Include="gip_riffmaster.h" />
-    <ClInclude Include="gip_auth.h" />
-    <ClInclude Include="riffmaster_config.h" />
-    <ClInclude Include="riffmaster_build.h" />
+    <ClInclude Include="gip_protocol.h" />
+    <ClInclude Include="xboxinput_config.h" />
     <ClInclude Include="controller_backend.h" />
     <ClInclude Include="gip_gamepad_parser.h" />
     <ClInclude Include="gamepad_mapping.h" />

@@ -39,6 +39,12 @@ struct XboxInputMappingOptions {
 
 extern XboxInputMappingOptions g_xboxInputGamepadMapping;
 
+// Readers take one immutable snapshot pointer per operation. Reload publishes a
+// completely parsed second buffer in one pointer exchange, so input and USB
+// callbacks can never observe a partially updated mapping.
+const XboxInputMappingOptions* XboxInputGetActiveMapping();
+void XboxInputPublishMapping(const XboxInputMappingOptions* mapping);
+
 void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping);
 void XboxInputApplyGamepadMapping(const XboxInputGipGamepadState* input,
 	const XboxInputMappingOptions* mapping, XboxInputGipGamepadState* output);

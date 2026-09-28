@@ -1,0 +1,22 @@
+[
+  {"name":"neutral","payload":"0000000000000000000000000000","valid":true,"buttons":0,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"a","payload":"1000000000000000000000000000","valid":true,"buttons":4096,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"b","payload":"2000000000000000000000000000","valid":true,"buttons":8192,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"x","payload":"4000000000000000000000000000","valid":true,"buttons":16384,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"y","payload":"8000000000000000000000000000","valid":true,"buttons":32768,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"start","payload":"0400000000000000000000000000","valid":true,"buttons":16,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"back","payload":"0800000000000000000000000000","valid":true,"buttons":32,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"dpad_up","payload":"0001000000000000000000000000","valid":true,"buttons":1,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"dpad_down","payload":"0002000000000000000000000000","valid":true,"buttons":2,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"dpad_left","payload":"0004000000000000000000000000","valid":true,"buttons":4,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"dpad_right","payload":"0008000000000000000000000000","valid":true,"buttons":8,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"left_shoulder","payload":"0010000000000000000000000000","valid":true,"buttons":256,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"right_shoulder","payload":"0020000000000000000000000000","valid":true,"buttons":512,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"left_thumb","payload":"0040000000000000000000000000","valid":true,"buttons":64,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"right_thumb","payload":"0080000000000000000000000000","valid":true,"buttons":128,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"all_buttons","payload":"fcff000000000000000000000000","valid":true,"buttons":62463,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"trigger_scaling","payload":"0000ff0300020000000000000000","valid":true,"buttons":0,"leftTrigger":255,"rightTrigger":128,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"signed_axes","payload":"0000000000000080ff7fffff3412","valid":true,"buttons":0,"leftTrigger":0,"rightTrigger":0,"leftX":-32768,"leftY":32767,"rightX":-1,"rightY":4660},
+  {"name":"ignored_reserved_bits","payload":"0300000000000000000000000000","valid":true,"buttons":0,"leftTrigger":0,"rightTrigger":0,"leftX":0,"leftY":0,"rightX":0,"rightY":0},
+  {"name":"short_payload","payload":"00000000000000000000000000","valid":false}
+]

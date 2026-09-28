@@ -20,5 +20,7 @@
     <ClInclude Include="controller_backend.h" />
     <ClInclude Include="gip_gamepad_parser.h" />
     <ClInclude Include="gamepad_mapping.h" />
+    <ClInclude Include="gip_protocol.h" />
+    <ClInclude Include="xboxinput_config.h" />
   </ItemGroup>
 </Project>

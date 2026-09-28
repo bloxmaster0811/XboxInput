@@ -1,5 +1,8 @@
 #include "gamepad_mapping.h"
 #include <string.h>
+#ifdef _XBOX
+#include <xtl.h>
+#endif
 
 static const uint16_t kButtonMasks[XBOXINPUT_MAPPING_BUTTON_COUNT] = {
 	0x0001, 0x0002, 0x0004, 0x0008,
@@ -14,6 +17,27 @@ static const char* const kButtonNames[XBOXINPUT_MAPPING_BUTTON_COUNT] = {
 };
 
 XboxInputMappingOptions g_xboxInputGamepadMapping;
+static XboxInputMappingOptions g_xboxInputGamepadMappingReload;
+static XboxInputMappingOptions* volatile g_xboxInputActiveMapping =
+	&g_xboxInputGamepadMapping;
+
+const XboxInputMappingOptions* XboxInputGetActiveMapping() {
+	return (const XboxInputMappingOptions*)g_xboxInputActiveMapping;
+}
+
+void XboxInputPublishMapping(const XboxInputMappingOptions* mapping) {
+	if (!mapping) return;
+	XboxInputMappingOptions* target =
+		g_xboxInputActiveMapping == &g_xboxInputGamepadMapping ?
+		&g_xboxInputGamepadMappingReload : &g_xboxInputGamepadMapping;
+	*target = *mapping;
+#ifdef _XBOX
+	MemoryBarrier();
+	InterlockedExchangePointer((PVOID volatile*)&g_xboxInputActiveMapping, target);
+#else
+	g_xboxInputActiveMapping = target;
+#endif
+}
 
 static char AsciiLower(char c) {
 	return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
