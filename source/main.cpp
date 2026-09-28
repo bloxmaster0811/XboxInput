@@ -1,4 +1,4 @@
-﻿#include <xtl.h>
+#include <xtl.h>
 #include <xkelib.h>
 #include <string>
 #include <fstream>
@@ -13,15 +13,14 @@
 #include "hid_parser.h"
 #include "usb.h"
 #include "mapping.h"
-#include "gip_riffmaster.h"
-#include "gip_auth.h"
-#include "riffmaster_build.h"
+#include "gip_protocol.h"
+#include "xboxinput_config.h"
 
 extern "C" void* _ReturnAddress(void);
 #pragma intrinsic(_ReturnAddress)
 
 // ---------------------------------------------------------------------------
-// ADDITIVE BUILD LADDER — RIFFMASTER_LEVEL, set by tools/build.ps1 -Level N.
+// Additive diagnostic build ladder retained for controlled fault isolation.
 //
 // Why this exists: the disconnect freeze was chased by SUBTRACTIVE bisection —
 // take the full driver, remove one subsystem, observe. Every such build still
@@ -50,49 +49,50 @@ extern "C" void* _ReturnAddress(void);
 //   4 NOTIFY    + XAM notification patches (custom type 80, timer, JRPC2 branch).
 //   5 HID       + HID add/remove detours, JSON mappings, mapping thread.
 //   6 USBRESET  + USB bugcheck patches and the "dirty" USB driver reset.
-//   7 FULL      + Usbd add/remove detours, the GIP claim, auth, XAM guitar.
+//   7 FULL      + Usbd add/remove detours, the GIP claim, auth, XAM gamepad.
 //
 // Level 7 is byte-for-byte the shipping driver; the ladder adds no behaviour.
 // ---------------------------------------------------------------------------
-#define RM_LVL_NULL      0
-#define RM_LVL_RESOLVE   1
-#define RM_LVL_NOPS      2
-#define RM_LVL_XAMHOOKS  3
-#define RM_LVL_NOTIFY    4
-#define RM_LVL_HID       5
-#define RM_LVL_USBRESET  6
-#define RM_LVL_FULL      7
+#define XBOXINPUT_LEVEL_NULL      0
+#define XBOXINPUT_LEVEL_RESOLVE   1
+#define XBOXINPUT_LEVEL_NOPS      2
+#define XBOXINPUT_LEVEL_XAMHOOKS  3
+#define XBOXINPUT_LEVEL_NOTIFY    4
+#define XBOXINPUT_LEVEL_HID       5
+#define XBOXINPUT_LEVEL_USBRESET  6
+#define XBOXINPUT_LEVEL_FULL      7
 
 // Map the ladder onto the flags the existing code already tests, so the levels
 // are a re-expression of known-good conditionals rather than a new code path.
-#if RIFFMASTER_LEVEL < RM_LVL_HID
-#define RIFFMASTER_GIP_ONLY 1        // no HID detours, no JSON, no mapping thread
+#define XBOXINPUT_BUILD_LEVEL XBOXINPUT_LEVEL_FULL
+
+#if XBOXINPUT_BUILD_LEVEL < XBOXINPUT_LEVEL_HID
+#define XBOXINPUT_GIP_ONLY 1
 #endif
-#if RIFFMASTER_LEVEL < RM_LVL_NOTIFY
-#define RIFFMASTER_NO_NOTIFY_PATCH 1
+#if XBOXINPUT_BUILD_LEVEL < XBOXINPUT_LEVEL_NOTIFY
+#define XBOXINPUT_NO_NOTIFY_PATCH 1
 #endif
-#if RIFFMASTER_LEVEL < RM_LVL_USBRESET
-#define RIFFMASTER_NO_USB_RESET 1    // also skips the two bugcheck patches
+#if XBOXINPUT_BUILD_LEVEL < XBOXINPUT_LEVEL_USBRESET
+#define XBOXINPUT_NO_USB_RESET 1
 #endif
 
 // ---------------------------------------------------------------------------
 // Logging levels.
 //
-// RM_LOG   - always on. Milestones and errors only: load, claim, endpoints,
-//            auth complete, XAM registration, teardown, anything that failed.
-// RM_DBG   - per-packet chatter (GIP chunks, input reports, USB probes,
+// XBOXINPUT_LOG   - always on. Milestones and errors only: load, claim, endpoints,
+//            controller ready, XAM registration, teardown, anything that failed.
+// XBOXINPUT_DBG   - per-packet chatter (GIP chunks, input reports, USB probes,
 //            capability queries). OFF by default.
 //
 // This is not just tidiness: DbgPrint on a hot path saturates the xbdm debug
 // channel and HANGS THE CONSOLE. That happened twice during development - once
-// dumping certificate hex during auth, once logging every capability query
-// (which the dash polls ~8x per 100ms). Keep hot paths under RM_DBG.
+// dumping every protocol packet, and once logging every capability query (which
+// the dash polls ~8x per 100ms). Keep hot paths under XBOXINPUT_DBG.
 // ---------------------------------------------------------------------------
-//#define RIFFMASTER_VERBOSE 1
-//#define RIFFMASTER_NO_NOTIFY_PATCH 1   // enable to skip the XAM notification patches
+//#define XBOXINPUT_VERBOSE 1
 
 // Debug Monitor is not present on most retail RGH setups. Mirror milestone logs
-// to a small FTP-readable file as well. RM_LOG is deliberately never used for
+// to a small FTP-readable file as well. XBOXINPUT_LOG is deliberately never used for
 // normal input packets, so this does not put filesystem I/O in the input path.
 // Keep diagnostics usable on consoles without an HDD (for example BadAvatar
 // installs that run from internal MU or USB).  The first writable device is
@@ -126,6 +126,7 @@ enum XboxInputLogEventType {
 	XBOXINPUT_LOG_NOTIFICATION = 9,
 	XBOXINPUT_LOG_PROFILE_DECISION = 10,
 	XBOXINPUT_LOG_NOTIFICATION_CANCELLED = 11,
+	XBOXINPUT_LOG_CONFIG_PATH = 12,
 };
 
 enum XboxInputInitStep {
@@ -284,6 +285,8 @@ static volatile DWORD g_xboxInputGuideUiState = 0;
 static volatile LONG g_xboxInputLogPathIndex = -1;
 static volatile LONG g_xboxInputLoggerReady = 0;
 
+#define XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX (-2)
+
 static const char* XboxInputInitStepName(DWORD step) {
 	switch (step) {
 	case XBOXINPUT_INIT_ENTRY: return "dll_entry";
@@ -329,6 +332,17 @@ static const char* XboxInputUsbStepName(DWORD step) {
 static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
 	const DWORD pathCount = sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0]);
 	LONG selected = g_xboxInputLogPathIndex;
+	if (selected == XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX) {
+#ifdef XBOXINPUT_COMPAT_PROBE
+		const char* path = compatibilityProbe ? XBOXINPUT_PROBE_PATH : XBOXINPUT_LOG_PATH;
+#else
+		UNREFERENCED_PARAMETER(compatibilityProbe);
+		const char* path = XBOXINPUT_LOG_PATH;
+#endif
+		FILE* file = fopen(path, mode);
+		if (file)
+			return file;
+	}
 	if (selected >= 0 && (DWORD)selected < pathCount) {
 #ifdef XBOXINPUT_COMPAT_PROBE
 		const char* path = compatibilityProbe
@@ -341,6 +355,22 @@ static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
 		FILE* file = fopen(path, mode);
 		if (file)
 			return file;
+	}
+
+	// Prefer the XEX directory. A private symbolic link is used when the loader
+	// supplied a native \\Device path, so this remains available before Usb: aliases.
+	if (selected != XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX) {
+#ifdef XBOXINPUT_COMPAT_PROBE
+		const char* path = compatibilityProbe ? XBOXINPUT_PROBE_PATH : XBOXINPUT_LOG_PATH;
+#else
+		const char* path = XBOXINPUT_LOG_PATH;
+#endif
+		FILE* file = fopen(path, mode);
+		if (file) {
+			InterlockedExchange(&g_xboxInputLogPathIndex,
+				XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX);
+			return file;
+		}
 	}
 
 	for (DWORD i = 0; i < pathCount; i++) {
@@ -380,20 +410,20 @@ static void XboxInputSetDiagStage(LONG stage) {
 // USB callbacks may run above PASSIVE_LEVEL, where filesystem calls can deadlock.
 // Keep their normal diagnostics on DbgPrint and let a system thread persist just
 // the latest coarse-grained stage to the FTP-readable file.
-#define RM_LOG(...) DbgPrint(__VA_ARGS__)
+#define XBOXINPUT_LOG(...) DbgPrint(__VA_ARGS__)
 
-// RM_TRACE - breadcrumbs on the device add/remove path only, for the `trace` variant.
-// Deliberately NOT tied to RIFFMASTER_VERBOSE: that also turns on per-packet logging,
+// XBOXINPUT_TRACE_LOG - breadcrumbs on the device add/remove path only, for the `trace` variant.
+// Deliberately NOT tied to XBOXINPUT_VERBOSE: that also turns on per-packet logging,
 // which floods xbdm and is itself a hazard. These fire a handful of times per plug event.
-#ifdef RIFFMASTER_TRACE
-#define RM_TRACE(...) DbgPrint(__VA_ARGS__)
+#ifdef XBOXINPUT_TRACE
+#define XBOXINPUT_TRACE_LOG(...) DbgPrint(__VA_ARGS__)
 #else
-#define RM_TRACE(...) ((void)0)
+#define XBOXINPUT_TRACE_LOG(...) ((void)0)
 #endif
-#ifdef RIFFMASTER_VERBOSE
-#define RM_DBG(...) DbgPrint(__VA_ARGS__)
+#ifdef XBOXINPUT_VERBOSE
+#define XBOXINPUT_DBG(...) DbgPrint(__VA_ARGS__)
 #else
-#define RM_DBG(...) ((void)0)
+#define XBOXINPUT_DBG(...) ((void)0)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -433,7 +463,7 @@ static void GipRestoreUsbBugchecks() {
 		// precedent with a dcbst/sync added for good measure.
 		__dcbst(0, p->addr);
 		__sync();
-		DbgPrint("RIFFMASTER: restored USB bugcheck at %p -> 0x%08X\r\n",
+		DbgPrint("XBOXINPUT: restored USB bugcheck at %p -> 0x%08X\r\n",
 			p->addr, p->original);
 	}
 }
@@ -465,7 +495,7 @@ static void XboxInputRestoreWgcDescriptorCheck() {
 		doSync((void*)instruction);
 	}
 	g_xboxInputWgcOpcodeAfter = *instruction;
-	RM_LOG("XBOXINPUT: WGC descriptor branch %08X -> %08X\r\n",
+	XBOXINPUT_LOG("XBOXINPUT: WGC descriptor branch %08X -> %08X\r\n",
 		g_xboxInputWgcOpcodeBefore, g_xboxInputWgcOpcodeAfter);
 }
 #endif
@@ -614,11 +644,13 @@ static DWORD XboxInputLogThread(PVOID) {
 			fprintf(file, "XboxInput detailed diagnostic log\r\n");
 			fprintf(file, "build=%s %s kernel=%u ladder=%u\r\n",
 				__DATE__, __TIME__, XboxKrnlVersion->Build,
-				(DWORD)RIFFMASTER_LEVEL);
-			fprintf(file, "logPath=%s retryPolicy=continuous eventBuffer=%u\r\n",
-				(pathIndex >= 0 && pathIndex < (LONG)(sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0])))
-					? kXboxInputLogPaths[pathIndex] : "unknown",
-				(DWORD)XBOXINPUT_LOG_EVENT_COUNT);
+				(DWORD)XBOXINPUT_BUILD_LEVEL);
+			fprintf(file, "logPath=%s retryPolicy=continuous eventBuffer=%u privateMount=%u status=%08X\r\n",
+				pathIndex == XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX ? XBOXINPUT_LOG_PATH :
+				((pathIndex >= 0 && pathIndex < (LONG)(sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0])))
+					? kXboxInputLogPaths[pathIndex] : "unknown"),
+				(DWORD)XBOXINPUT_LOG_EVENT_COUNT,
+				(DWORD)(g_xboxInputUsingPrivateMount ? 1 : 0), g_xboxInputPrivateMountStatus);
 			if (XboxInputFinishLogWrite(file)) {
 				InterlockedExchange(&g_xboxInputLoggerReady, 1);
 				break;
@@ -746,6 +778,13 @@ static DWORD XboxInputLogThread(PVOID) {
 					fprintf(file, "tick=%lu event=disconnect_notification_cancelled reason=%s remaining=%08X\r\n",
 						event->tick, event->value1 ? "timeout" : "reconnected",
 						event->value2);
+					break;
+				case XBOXINPUT_LOG_CONFIG_PATH:
+					fprintf(file, "tick=%lu event=config_path state=%s path=%s\r\n",
+						event->tick,
+						event->value1 == 1 ? "loaded" :
+						(event->value1 == 2 ? "generated" : "unavailable"),
+						XBOXINPUT_CFG_PATH);
 					break;
 				case XBOXINPUT_LOG_PROFILE_DECISION: {
 					WORD vid = (WORD)(event->value1 >> 16);
@@ -2019,30 +2058,30 @@ static const char* KtXferName(int t) {
 }
 
 static void KtLogDevice(deviceHandle* handle, usb_device_descriptor* dd, usb_interface_descriptor* id) {
-	RM_DBG("RIFFMASTER: ===== DEVICE REACHED HidAddDeviceHook (handle %p) =====\r\n", handle);
+	XBOXINPUT_DBG("XBOXINPUT: ===== DEVICE REACHED HidAddDeviceHook (handle %p) =====\r\n", handle);
 
 	if (dd) {
-		RM_DBG("RIFFMASTER: VID=%04X PID=%04X bcdDevice=%04X bcdUSB=%04X\r\n",
+		XBOXINPUT_DBG("XBOXINPUT: VID=%04X PID=%04X bcdDevice=%04X bcdUSB=%04X\r\n",
 			swap_endianness_16(dd->idVendor), swap_endianness_16(dd->idProduct),
 			swap_endianness_16(dd->bcdDevice), swap_endianness_16(dd->bcdUSB));
-		RM_DBG("RIFFMASTER: dev class=%02X subclass=%02X protocol=%02X maxPacket0=%d numCfg=%d\r\n",
+		XBOXINPUT_DBG("XBOXINPUT: dev class=%02X subclass=%02X protocol=%02X maxPacket0=%d numCfg=%d\r\n",
 			dd->bDeviceClass, dd->bDeviceSubClass, dd->bDeviceProtocol,
 			dd->bMaxPacketSize0, dd->bNumConfigurations);
 	}
 	else {
-		RM_DBG("RIFFMASTER: device descriptor is NULL\r\n");
+		XBOXINPUT_DBG("XBOXINPUT: device descriptor is NULL\r\n");
 	}
 
 	if (id) {
-		RM_DBG("RIFFMASTER: iface #%d alt=%d numEndpoints=%d class=%02X subclass=%02X protocol=%02X\r\n",
+		XBOXINPUT_DBG("XBOXINPUT: iface #%d alt=%d numEndpoints=%d class=%02X subclass=%02X protocol=%02X\r\n",
 			id->bInterfaceNumber, id->bAlternateSetting, id->bNumEndpoints,
 			id->bInterfaceClass, id->bInterfaceSubClass, id->bInterfaceProtocol);
-		// GIP signature per docs/gip_riffmaster.md section 2 (verified from capture).
+		// GIP signature per docs/GIP protocol notes section 2 (verified from capture).
 		if (id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 && id->bInterfaceProtocol == 0xD0)
-			RM_DBG("RIFFMASTER: *** GIP SIGNATURE FF/47/D0 - THIS IS A GIP DEVICE ***\r\n");
+			XBOXINPUT_DBG("XBOXINPUT: *** GIP SIGNATURE FF/47/D0 - THIS IS A GIP DEVICE ***\r\n");
 	}
 	else {
-		RM_DBG("RIFFMASTER: interface descriptor is NULL\r\n");
+		XBOXINPUT_DBG("XBOXINPUT: interface descriptor is NULL\r\n");
 	}
 
 	// The only endpoint accessor available is indexed by (transfer type, direction).
@@ -2067,7 +2106,7 @@ static void KtLogDevice(deviceHandle* handle, usb_device_descriptor* dd, usb_int
 				if (ep->bLength != 7 || ep->bDescriptorType != 5)
 					continue;   // not an endpoint descriptor - do not trust the rest
 				found++;
-				RM_DBG("RIFFMASTER:   EP %02X %s %s maxPacket=%d interval=%d\r\n",
+				XBOXINPUT_DBG("XBOXINPUT:   EP %02X %s %s maxPacket=%d interval=%d\r\n",
 					ep->bEndpointAddress,
 					(ep->bEndpointAddress & 0x80) ? "IN" : "OUT",
 					KtXferName(ep->bmAttributes),
@@ -2076,8 +2115,8 @@ static void KtLogDevice(deviceHandle* handle, usb_device_descriptor* dd, usb_int
 			}
 		}
 	}
-	RM_DBG("RIFFMASTER: %d endpoint(s) found in %d probes\r\n", found, probes);
-	RM_DBG("RIFFMASTER: ======================================================\r\n");
+	XBOXINPUT_DBG("XBOXINPUT: %d endpoint(s) found in %d probes\r\n", found, probes);
+	XBOXINPUT_DBG("XBOXINPUT: ======================================================\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -2121,7 +2160,7 @@ static bool ProbeShouldLog(int slot) {
 	// Say so when we stop, rather than going silently quiet - a silent stop reads
 	// exactly like "the device never called this", which is the opposite conclusion.
 	if (g_probeCount[slot] > PROBE_LIMIT) {
-		RM_DBG("RIFFMASTER: PROBE slot %d hit log limit (%d) - further calls NOT logged\r\n",
+		XBOXINPUT_DBG("XBOXINPUT: PROBE slot %d hit log limit (%d) - further calls NOT logged\r\n",
 			slot, PROBE_LIMIT);
 		return false;
 	}
@@ -2131,7 +2170,7 @@ static bool ProbeShouldLog(int slot) {
 static void ProbeLog(int slot, const char* name, void* handle) {
 	if (!ProbeShouldLog(slot))
 		return;
-	RM_DBG("RIFFMASTER: PROBE %-28s handle=%p\r\n", name, handle);
+	XBOXINPUT_DBG("XBOXINPUT: PROBE %-28s handle=%p\r\n", name, handle);
 }
 
 usb_device_descriptor* UsbdGetDeviceDescriptorHook(deviceHandle* h) {
@@ -2139,11 +2178,11 @@ usb_device_descriptor* UsbdGetDeviceDescriptorHook(deviceHandle* h) {
 		UsbdGetDeviceDescriptorDetour.GetOriginal<decltype(&UsbdGetDeviceDescriptorHook)>()(h);
 	if (ProbeShouldLog(0)) {
 		if (d)
-			RM_DBG("RIFFMASTER: PROBE UsbdGetDeviceDescriptor  handle=%p  VID=%04X PID=%04X devclass=%02X\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: PROBE UsbdGetDeviceDescriptor  handle=%p  VID=%04X PID=%04X devclass=%02X\r\n",
 				h, swap_endianness_16(d->idVendor), swap_endianness_16(d->idProduct),
 				d->bDeviceClass);
 		else
-			RM_DBG("RIFFMASTER: PROBE UsbdGetDeviceDescriptor  handle=%p  (NULL descriptor)\r\n", h);
+			XBOXINPUT_DBG("XBOXINPUT: PROBE UsbdGetDeviceDescriptor  handle=%p  (NULL descriptor)\r\n", h);
 	}
 	return d;
 }
@@ -2153,11 +2192,11 @@ usb_interface_descriptor* UsbdGetInterfaceDescriptorHook(deviceHandle* h) {
 		UsbdGetInterfaceDescriptorDetour.GetOriginal<decltype(&UsbdGetInterfaceDescriptorHook)>()(h);
 	if (ProbeShouldLog(1)) {
 		if (d)
-			RM_DBG("RIFFMASTER: PROBE UsbdGetInterfaceDescriptor handle=%p  iface=%d class=%02X/%02X/%02X\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: PROBE UsbdGetInterfaceDescriptor handle=%p  iface=%d class=%02X/%02X/%02X\r\n",
 				h, d->bInterfaceNumber, d->bInterfaceClass,
 				d->bInterfaceSubClass, d->bInterfaceProtocol);
 		else
-			RM_DBG("RIFFMASTER: PROBE UsbdGetInterfaceDescriptor handle=%p  (NULL)\r\n", h);
+			XBOXINPUT_DBG("XBOXINPUT: PROBE UsbdGetInterfaceDescriptor handle=%p  (NULL)\r\n", h);
 	}
 	return d;
 }
@@ -2167,10 +2206,10 @@ int UsbdGetDeviceSpeedHook(deviceHandle* h) {
 	return UsbdGetDeviceSpeedDetour.GetOriginal<decltype(&UsbdGetDeviceSpeedHook)>()(h);
 }
 
-// RiffMaster identity - verified from the PC capture, docs/gip_riffmaster.md section 1,
+// Supported controller identity - verified from the PC capture, docs/GIP protocol notes section 1,
 // and confirmed on-console by probe2 (VID=0E6F PID=0248 class=FF/47/D0).
-// NOTE: PID 0x0247 is the guitar's BOOTLOADER ("PDP.Xbox.Controller.Bootloader" per
-// refs/PlasticBand/Docs/Descriptor Dumps/Xbox One/PDP Riffmaster Wired (Bootloader).txt)
+// NOTE: PID 0x0247 is the controller's BOOTLOADER ("PDP.Xbox.Controller.Bootloader" per
+// refs/PlasticBand/Docs/Descriptor Dumps/Xbox One/PDP GIP wired (Bootloader).txt)
 // - deliberately NOT matched here.
 // Official Microsoft wired Xbox One / Series gamepads supported by the Linux
 // xpad driver's upstream device table. Keep this an explicit controller list:
@@ -2207,13 +2246,8 @@ static XboxInputUsbInterfaceIdentity XboxInputInterfaceIdentity(
 	return identity;
 }
 
-// Budget of claim attempts, NOT reset by teardown - only by a connection that reaches
-// AUTH HANDSHAKE COMPLETE (main.cpp, GIP_CMD_AUTHENTICATE handler).
-//
-// Why this matters: turning the guitar off makes the dongle bounce off and back onto
-// USB repeatedly - six blade transitions were observed while holding the guide button,
-// plus two more after power-down. Teardown used to reset this counter, so every bounce
-// bought three fresh claims and the storm ran unbounded.
+// Budget claim attempts across a connection bounce. It is refilled only after a
+// controller reaches a valid ready/input state, never during teardown.
 //
 // Reusing one static extension across disconnect/reconnect was dangerous because an
 // asynchronous completion from the old device could arrive after the same TRB had
@@ -2238,19 +2272,7 @@ enum PowerAInitStage {
 	POWERA_INIT_RUMBLE_STOP,
 	POWERA_INIT_COMPLETE,
 };
-// The normal wired gamepad does not use the RiffMaster dongle's RSA path.
-static bool    g_gipAuthStarted = true;
 static uint32_t g_gipChunkTotal = 0;
-static uint32_t g_gipAuthChunkTotal = 0;
-static int      g_gipCertBytes = 0;
-static int      g_gipAuthStage = 0;
-static BYTE     g_gipHostRandom[32];    // our HOST_HELLO random
-static BYTE     g_gipClientRandom[32];  // from CLIENT_HELLO
-static BYTE     g_gipPms[48];           // premaster secret, input to the PRF
-static BYTE     g_gipMasterSecret[48];
-static GipTranscript g_gipTranscript;
-static BYTE     g_gipHostFinish[50];
-static bool     g_gipHostFinishReady = false;
 
 // ---- unified controller-session ownership ----------------------------------
 //
@@ -2689,88 +2711,8 @@ static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE ri
 	return queued;
 }
 
-//
-// ---- GIP auth (command 0x06) -----------------------------------------------
-// Layout is struct gip_auth_pkt_host_hello from refs/xone/auth/auth.c:77-85,
-// built by gip_auth_send_pkt (auth.c:162-184):
-//
-//   handshake header (6): context, options, error, command, be16 length
-//   data header      (4): command, version, be16 length
-//   random          (32)
-//   unknown1         (4)
-//   unknown2         (4)
-//   trailer          (8)
-//                   = 58 bytes total
-//
-// data_len   = 58 - 6 - 8      = 44 = 0x2C  -> handshake.length
-// data.length= 44 - 4          = 40 = 0x28
-//
-// Every one of those matches the captured host packet byte for byte:
-//   06 30 01 3a | 00 41 00 01 00 2c | 01 01 00 28 | <32 random> ...
-//
-// NOTE the capture has a non-zero value at unknown2 (45 7B AF E9) where xone
-// sends zeros. xone works with zeros, so we send zeros and record the difference.
-//
-#define GIP_AUTH_CTX_HANDSHAKE   0x00
-#define GIP_AUTH_OPT_ACK         0x01
-#define GIP_AUTH_OPT_FROM_HOST   0x40
-#define GIP_AUTH_CMD_HOST_HELLO  0x01
-#define GIP_AUTH_CMD_CLIENT_HELLO 0x02
-#define GIP_AUTH_CMD_CLIENT_CERT 0x03
-
-//
-// NOT cryptographically secure - this is a probe. The real implementation must use
-// the kernel's XeCryptRandom. Sufficient here because we only need the device to
-// accept a well-formed hello and reply with its certificate.
-//
-static void GipFillWeakRandom(BYTE* p, int n) {
-	static uint32_t s = 0;
-	if (!s)
-		s = GetTickCount() | 1;
-	for (int i = 0; i < n; i++) {
-		s = s * 1664525u + 1013904223u;      // Numerical Recipes LCG
-		p[i] = (BYTE)(s >> 24);
-	}
-}
-
-static void GipSendHostHello(deviceHandle* h) {
-	BYTE p[58];
-	memset(p, 0, sizeof(p));
-
-	p[0] = GIP_AUTH_CTX_HANDSHAKE;                       // context
-	p[1] = GIP_AUTH_OPT_ACK | GIP_AUTH_OPT_FROM_HOST;    // 0x41
-	p[2] = 0x00;                                         // error
-	p[3] = GIP_AUTH_CMD_HOST_HELLO;                      // 0x01
-	p[4] = 0x00; p[5] = 0x2C;                            // be16 length = 44
-
-	p[6] = GIP_AUTH_CMD_HOST_HELLO;                      // data.command
-	p[7] = 0x01;                                         // data.version (v1)
-	p[8] = 0x00; p[9] = 0x28;                            // be16 length = 40
-
-	XeCryptRandom(p + 10, 32);                           // random[32]
-	memcpy(g_gipHostRandom, p + 10, 32);                 // needed by the PRF
-	// unknown1[4], unknown2[4], trailer[8] stay zero, as in xone.
-
-	// HOST_HELLO is the first handshake message: reset the transcript and add it.
-	// Sent packets contribute [6, 6+data_len); data_len = 58 - 6 - 8 = 44.
-	GipTranscriptReset(&g_gipTranscript);
-	GipTranscriptAdd(&g_gipTranscript, p + 6, 44);
-
-	RM_DBG("RIFFMASTER: -> sending AUTH HOST_HELLO (58 bytes)\r\n");
-	GipSend(h, GIP_CMD_AUTHENTICATE, GIP_OPT_INTERNAL | GIP_OPT_ACKNOWLEDGE,
-		p, sizeof(p));
-}
-
-//
-// Accumulate the chunked certificate so we can parse it, and settle the RSA
-// endianness question with a deterministic known-answer test.
-//
-#define GIP_CERT_BUF_MAX 1100
-static BYTE g_gipCertBuf[GIP_CERT_BUF_MAX];
-static void GipHexDump(const char* tag, const BYTE* d, int n);   // defined below
-static void GipSendChunked(deviceHandle* h, BYTE cmd, const BYTE* data, int total);
 static void GipRegisterWithXam();
-static void GipFillGuitarCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad);
+static void GipFillGamepadCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad);
 static void GipUnregisterFromXam();
 
 static int GipPowerAQueueStage(LONG stage);
@@ -2861,132 +2803,6 @@ static int GipPowerAQueueStage(LONG stage) {
 	return 0;
 }
 
-#define GIP_AUTH_CMD_HOST_SECRET 0x05
-#define GIP_AUTH_CMD_HOST_FINISH 0x07
-#define GIP_AUTH_CMD_CLIENT_FINISH 0x08
-
-static void GipRsaSelfTest() {
-	// Auth payload = 10-byte header (handshake 6 + data 4) then the DER certificate.
-	if (g_gipCertBytes <= 10) {
-		RM_LOG("RIFFMASTER: RSA selftest skipped - no certificate\r\n");
-		return;
-	}
-	const BYTE* der = g_gipCertBuf + 10;
-	int derLen = g_gipCertBytes - 10;
-
-	static BYTE modulus[RSA2048_BYTES];
-	uint32_t pubExp = 0;
-	if (!GipCertGetRsaPubKey(der, derLen, modulus, &pubExp)) {
-		RM_LOG("RIFFMASTER: RSA selftest FAILED - could not parse pubkey from cert\r\n");
-		return;
-	}
-	RM_DBG("RIFFMASTER: cert pubkey parsed: exponent=%u modulus starts %02X%02X%02X%02X\r\n",
-		pubExp, modulus[0], modulus[1], modulus[2], modulus[3]);
-
-	// Deterministic message: 48 bytes of 0xAA, PKCS#1 v1.5 with all-0xFF padding.
-    // tools/rsa_check.py computes the expected ciphertext from the same modulus.
-	static BYTE msg[48];
-	static BYTE em[RSA2048_BYTES];
-	static BYTE outA[RSA2048_BYTES];
-	static BYTE outB[RSA2048_BYTES];
-	memset(msg, 0xAA, sizeof(msg));
-	if (!GipPkcs1Pad(msg, sizeof(msg), em, true)) {
-		RM_LOG("RIFFMASTER: RSA selftest FAILED - padding\r\n");
-		return;
-	}
-
-	// Expected ciphertext, computed offline from this modulus by tools/rsa_check.py.
-	// Our own bignum modexp should reproduce it exactly.
-	RM_DBG("RIFFMASTER: --- RSA SELFTEST (expect CA FA 27 9B ...) ---\r\n");
-
-	bool ok = GipRsaPubCrypt(modulus, pubExp, em, outA);
-	static const BYTE expect[8] = { 0xCA,0xFA,0x27,0x9B,0x03,0x68,0x3F,0x84 };
-	bool pass = ok && !memcmp(outA, expect, 8);
-	RM_LOG("RIFFMASTER: *** RSA SELFTEST: %s ***\r\n", pass ? "PASS" : "FAIL");
-	if (!pass) {
-		if (ok) GipHexDump("rsa", outA, 32);
-		return;                       // do not build a handshake on broken crypto
-	}
-	(void)outB;
-
-	// ---- HOST_SECRET -----------------------------------------------------
-	// struct gip_auth_pkt_host_secret (refs/xone/auth/auth.c:87-93):
-	//     header_full (10) + encrypted_pms (256) + trailer (8) = 274 bytes
-	// data_len   = 274 - 6 - 8 = 260 = 0x0104   -> handshake.length
-	// data.length= 260 - 4     = 256 = 0x0100
-	static BYTE pms[48];
-	static BYTE pkt[274];
-
-	XeCryptRandom(pms, sizeof(pms));
-	memcpy(g_gipPms, pms, sizeof(pms));      // kept for the PRF / master secret
-
-	if (!GipPkcs1Pad(pms, sizeof(pms), em, false)) {
-		RM_LOG("RIFFMASTER: HOST_SECRET padding failed\r\n");
-		return;
-	}
-	if (!GipRsaPubCrypt(modulus, pubExp, em, pkt + 10)) {
-		RM_LOG("RIFFMASTER: HOST_SECRET RSA failed\r\n");
-		return;
-	}
-
-	memset(pkt, 0, 10);
-	pkt[0] = GIP_AUTH_CTX_HANDSHAKE;
-	pkt[1] = GIP_AUTH_OPT_ACK | GIP_AUTH_OPT_FROM_HOST;   // 0x41
-	pkt[2] = 0x00;
-	pkt[3] = GIP_AUTH_CMD_HOST_SECRET;                    // 0x05
-	pkt[4] = 0x01; pkt[5] = 0x04;                         // be16 260
-	pkt[6] = GIP_AUTH_CMD_HOST_SECRET;
-	pkt[7] = 0x01;                                        // version 1
-	pkt[8] = 0x01; pkt[9] = 0x00;                         // be16 256
-	memset(pkt + 266, 0, 8);                              // trailer
-
-	// Transcript: sent packets contribute [6, 6+data_len) - trailer excluded.
-	GipTranscriptAdd(&g_gipTranscript, pkt + 6, 260);
-
-	RM_DBG("RIFFMASTER: -> sending HOST_SECRET (274 bytes, chunked)\r\n");
-	GipSendChunked(g_gipExt.deviceHandle, GIP_CMD_AUTHENTICATE, pkt, sizeof(pkt));
-	g_gipAuthStage = 4;
-
-	// ---- master secret + HOST_FINISH -------------------------------------
-	// master_secret = PRF(pms, "Master Secret", host_random || client_random)[48]
-	static BYTE randoms[64];
-	memcpy(randoms, g_gipHostRandom, 32);
-	memcpy(randoms + 32, g_gipClientRandom, 32);
-	GipPrf(g_gipPms, sizeof(g_gipPms), "Master Secret", randoms, sizeof(randoms),
-		g_gipMasterSecret, sizeof(g_gipMasterSecret));
-
-	// verify_data = PRF(master_secret, "Host Finished", SHA256(transcript))[32]
-	static BYTE transcript[32];
-	GipTranscriptHash(&g_gipTranscript, transcript);
-
-	static BYTE fin[50];
-	memset(fin, 0, sizeof(fin));
-	fin[0] = GIP_AUTH_CTX_HANDSHAKE;
-	fin[1] = GIP_AUTH_OPT_ACK | GIP_AUTH_OPT_FROM_HOST;   // 0x41
-	fin[2] = 0x00;
-	fin[3] = GIP_AUTH_CMD_HOST_FINISH;                    // 0x07
-	fin[4] = 0x00; fin[5] = 0x24;                         // be16 36
-	fin[6] = GIP_AUTH_CMD_HOST_FINISH;
-	fin[7] = 0x01;
-	fin[8] = 0x00; fin[9] = 0x20;                         // be16 32
-	GipPrf(g_gipMasterSecret, sizeof(g_gipMasterSecret), "Host Finished",
-		transcript, sizeof(transcript), fin + 10, 32);
-	// fin[42..49] trailer stays zero
-
-	RM_DBG("RIFFMASTER: transcript %d bytes, hash %02X%02X%02X%02X\r\n",
-		g_gipTranscript.len, transcript[0], transcript[1], transcript[2], transcript[3]);
-
-	// HOST_FINISH is prepared now but NOT sent yet.
-	//
-	// The device must RSA-DECRYPT the premaster secret with its private key before it
-	// can verify anything that depends on the master secret. In the capture that takes
-	// ~680 ms, and the host waits for the device's response before sending HOST_FINISH.
-	// The previous build sent both back to back and the handshake stalled.
-	memcpy(g_gipHostFinish, fin, sizeof(fin));
-	g_gipHostFinishReady = true;
-	RM_DBG("RIFFMASTER: HOST_FINISH prepared, waiting for device to process HOST_SECRET\r\n");
-}
-
 //
 // ---- XAM virtual controller -------------------------------------------------
 // Registration mirrors what hiddriver360 does for a claimed HID controller
@@ -3000,184 +2816,10 @@ static void GipRsaSelfTest() {
 //
 static int      g_gipCapsLogged = 0;
 static int      g_gipCaps2Logged = 0;
-
-//
-// Fill the capability fields the way a REAL Xbox 360 guitar reports them.
-//
-// The previous version put the live input state into capabilities->Gamepad. That is
-// wrong: in XINPUT_CAPABILITIES the Gamepad member is a CAPABILITY MASK describing which
-// inputs exist and at what resolution, not the current reading. Guitar Hero did not care;
-// Rock Band refused to see the device at all, and this is the most likely reason.
-//
-// Values taken from a real wired Rock Band 1 Stratocaster:
-//   refs/PlasticBand/Docs/Descriptor Dumps/Xbox 360/
-//       Rock Band 1 Stratocaster Guitar Capabilities.txt
-//     SubType:  0x06 (Guitar)
-//     Flags:    0x000C (Voice, PluginModules)
-//     Buttons:  0xF57F (DpadUp/Down/Left/Right, Start, Back, LeftThumb, LeftShoulder,
-//                       Guide, A, B, X, Y)
-//     RightThumb: X 0xFFC0  Y 0xFFC0
-//
-// ---------------------------------------------------------------------------
-// Which SubType the virtual guitar reports.
-//
-// The XDK names two (xinputdefs.h:40-41):
-//     XINPUT_DEVSUBTYPE_GUITAR           0x06   what Rock Band guitars report
-//     XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE 0x07   what Guitar Hero guitars report
-//
-// `[VERIFIED on hardware]` 0x06 works in BOTH Rock Band and Guitar Hero: World Tour on
-// the test console. PlasticBand documents GH guitars as reporting 0x07, but that is what
-// the hardware ADVERTISES, not what the game REQUIRES - and empirically GH accepts 0x06.
-//
-// `[UNTESTED]` The older Guitar Hero titles - GH2, GH3, Aerosmith, Metallica,
-// Van Halen, Smash Hits, Warriors of Rock - have not been tried. If one of them refuses
-// to see the guitar, rebuild with:
-//     -DRIFFMASTER_SUBTYPE=0x07
-// and please report which title needed it, so this can become a documented list rather
-// than a guess.
-//
-// Per-title automatic switching is the eventual answer and is NOT implemented, because
-// it cannot be done honestly without hardware evidence. Sketch, for whoever does it:
-// resolve XamGetCurrentTitleId, map the title ID to a subtype, and answer the capability
-// hooks accordingly. The hard part is not the code - it is that every entry in that table
-// needs a real console to confirm it, and a wrong entry silently breaks a game that
-// currently works. Do not ship a table of guesses. See docs/KNOWN_ISSUES.md.
-// ---------------------------------------------------------------------------
-#ifndef RIFFMASTER_SUBTYPE
-#define RIFFMASTER_SUBTYPE XINPUT_DEVSUBTYPE_GUITAR
-#endif
-
-// ---------------------------------------------------------------------------
-// Per-title subtype overrides.
-//
-// *** THIS TABLE IS EMPTY ON PURPOSE. DO NOT POPULATE IT FROM MEMORY OR FROM A
-// *** TITLE-ID LIST FOUND ONLINE. Every entry must come from a console log of the
-// *** game actually failing with the default subtype.
-//
-// The default (0x06, Rock Band's subtype) is VERIFIED working in Rock Band 3 and
-// Guitar Hero: World Tour. Until a title is observed to FAIL with it, adding an entry
-// here can only break something that currently works - a wrong override is invisible
-// until someone loads that game and finds no guitar.
-//
-// How to add an entry properly:
-//   1. Boot the game with the guitar connected and this build loaded.
-//   2. Read the "title id 0x........" line this prints on every title change.
-//   3. If the guitar WORKED, add nothing.
-//   4. If it did NOT work, add { <that id>, XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE, "name" }
-//      and re-test the same game to confirm the override actually fixes it.
-//
-// The title ID is logged for every game either way, so a full pass over a library
-// produces the ID list as a side effect, without anybody having to guess.
-// ---------------------------------------------------------------------------
-struct GipTitleSubType {
-	DWORD       titleId;
-	BYTE        subType;
-	const char* name;
-};
-
-// Defined further down with the other resolved XAM pointers; declared here because the
-// lookup below is defined before that block.
 extern void* XamGetCurrentTitleIdPtr;
 
-static const GipTitleSubType g_gipTitleSubTypes[] = {
-	// Guitar Hero III: Legends of Rock.
-	// `[VERIFIED both ways]` The ONLY title out of nine tested that does not see the
-	// guitar with the default 0x06, and it works with 0x07. Every other Guitar Hero and
-	// Rock Band title tested works with 0x06, so this is a per-title quirk and not an
-	// era-wide split.
-	// NTSC disc. A PAL or reissued copy may carry a different title ID and would need
-	// its own entry - see the region warning in the README.
-	{ 0x415607F7, XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE, "Guitar Hero III" },
 
-	{ 0, 0, 0 }   // terminator
-};
-
-// Title IDs observed on hardware (NTSC discs, kernel 17559). 21 titles tested; exactly
-// ONE needs an override. Kept as a comment rather than as table entries, because an entry
-// matching the default would do nothing except create a place for a typo to break a
-// working game.
-//
-//   Activision (0x4156)
-//     0x415607E7  Guitar Hero II                          0x06  works
-//     0x415607F7  Guitar Hero III: Legends of Rock        0x07  <- OVERRIDDEN above
-//     0x41560819  Guitar Hero: Aerosmith                  0x06  works
-//     0x4156081A  Guitar Hero: World Tour                 0x06  works
-//     0x41560830  Guitar Hero: Metallica                  0x06  works
-//     0x4156083D  Guitar Hero: Van Halen                  0x06  works
-//     0x4156083E  Guitar Hero: Smash Hits                 0x06  works
-//     0x41560840  Guitar Hero 5                           0x06  works
-//     0x4156085C  Band Hero                               0x06  works
-//     0x41560883  Guitar Hero 1                           0x06  works
-//
-//   Harmonix / MTV / EA (0x4541)
-//     0x45410829  Rock Band 1                             0x06  works
-//     0x45410869  Rock Band 2                             0x06  works
-//     0x45410881  Rock Band Track Pack Vol. 2             0x06  works
-//     0x45410889  Rock Band: AC/DC Live                   0x06  works
-//     0x454108B0  Rock Band Track Pack: Classic Rock      0x06  works
-//     0x454108B1  The Beatles: Rock Band                  0x06  works
-//     0x454108CA  Rock Band Country Track Pack            0x06  works
-//     0x454108CD  Rock Band Metal Track Pack              0x06  works
-//     0x45410914  Rock Band 3                             0x06  works
-//     0x4541092C  Rock Band Country Track Pack 2          0x06  works
-//
-//   Warner Bros. (0x5752)
-//     0x575207F0  Lego Rock Band                          0x06  works
-//
-//   Untested: Green Day: Rock Band crashes on startup, twice, before input matters.
-//   Not attributed to this plugin - it has not been checked with the plugin unloaded.
-//
-// DO NOT INFER A SUBTYPE FROM THE PUBLISHER PREFIX. Nine of the ten Activision titles
-// work on 0x06, the *Rock Band* subtype, and the one exception (GH3) sits in the middle
-// of that range. The split is per-title and has no pattern anyone has found.
-
-static BYTE GipSubTypeForCurrentTitle() {
-	// Cached and refreshed at most once a second. This runs on the capability path,
-	// which the dash polls ~8 times per 100 ms, and it calls into XAM from inside a XAM
-	// hook - re-entrancy that has bitten this project before. Once a second is plenty:
-	// a title change is a disc load, not a hot event.
-	static DWORD s_lastPoll = 0;
-	static DWORD s_titleId = 0;
-	static BYTE  s_subType = RIFFMASTER_SUBTYPE;
-
-	DWORD now = GetTickCount();
-	if (XamGetCurrentTitleIdPtr && (s_lastPoll == 0 || (now - s_lastPoll) >= 1000)) {
-		s_lastPoll = now;
-		typedef DWORD(*xam_get_current_title_id_t)(void);
-		DWORD id = ((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)();
-
-		if (id != s_titleId) {
-			s_titleId = id;
-			s_subType = g_rmCfg.defaultSubType;
-			const char* why = "default";
-
-			for (int i = 0; g_gipTitleSubTypes[i].titleId != 0; i++) {
-				if (g_gipTitleSubTypes[i].titleId == id) {
-					s_subType = g_gipTitleSubTypes[i].subType;
-					why = g_gipTitleSubTypes[i].name;
-					break;
-				}
-			}
-
-			// XboxInput.ini wins over the built-in table. Title IDs differ between
-			// regions and reissues, so a user with a PAL disc must be able to fix it
-			// without rebuilding - and equally must be able to override an entry of
-			// ours that turns out to be wrong on their console.
-			BYTE user = RmCfgSubTypeOverride(id);
-			if (user) {
-				s_subType = user;
-				why = "XboxInput.ini";
-			}
-			// One line per title change. Safe on this hot path precisely because a
-			// title change is rare; do not move this outside the `id != s_titleId` test.
-			RM_LOG("RIFFMASTER: title id 0x%08X -> SubType 0x%02X (%s)\r\n",
-				id, s_subType, why);
-		}
-	}
-	return s_subType;
-}
-
-static void GipFillGuitarCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad) {
+static void GipFillGamepadCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad) {
 	type    = XINPUT_DEVTYPE_GAMEPAD;
 	subType = XINPUT_DEVSUBTYPE_GAMEPAD;
 	flags   = 0;
@@ -3190,19 +2832,10 @@ static void GipFillGuitarCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAM
 }
 
 static void GipRegisterWithXam() {
-#ifdef RIFFMASTER_NO_XAM_REGISTER
-	// L7-noxam: exercise the ENTIRE USB half — claim, both interrupt endpoints, the
-	// re-arm loop, the full RSA auth handshake — and never touch XAM. The guitar will
-	// not work; that is the point. It splits L7's two halves so the freeze can be
-	// attributed to one of them instead of to "the claim path" as a whole.
-	RM_LOG("RIFFMASTER: XAM registration SKIPPED (noxam variant)\r\n");
-	return;
-#endif
 	if (g_gipRuntime.playerIndex != 0xFF)
 		return;                       // already registered
 
-	// Pick a slot hiddriver360 is not using so a real pad and the guitar cannot
-	// collide on the same XAM index.
+	// Pick a slot not used by an existing controller.
 	int idx = -1;
 	for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
 		if (connectedControllers[i].controllerDriver)
@@ -3223,7 +2856,7 @@ static void GipRegisterWithXam() {
 		}
 	}
 	if (idx < 0) {
-		RM_LOG("RIFFMASTER: no free XAM slot!\r\n");
+		XBOXINPUT_LOG("XBOXINPUT: no free XAM slot!\r\n");
 		return;
 	}
 
@@ -3238,7 +2871,7 @@ static void GipRegisterWithXam() {
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_XAM_REGISTER,
 		((DWORD)userIndex << 24) | (context & 0x00FFFFFF));
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_READY, userIndex, context);
-	RM_LOG("XBOXINPUT: registered virtual GAMEPAD in XAM, user index %d\r\n",
+	XBOXINPUT_LOG("XBOXINPUT: registered virtual GAMEPAD in XAM, user index %d\r\n",
 		userIndex);
 }
 
@@ -3249,9 +2882,9 @@ static void GipUnregisterFromXam() {
 	int idx = (int)(g_gipRuntime.deviceContext - 0x0000000010000005);
 	XamUserBindDeviceCallback(0xa7553952 + idx,
 		g_gipRuntime.deviceContext, 0, true, 0);
-	// RM_DBG, not RM_LOG: only caller is UsbdRemoveDeviceCompleteHook, and DbgPrint
+	// XBOXINPUT_DBG, not XBOXINPUT_LOG: only caller is UsbdRemoveDeviceCompleteHook, and DbgPrint
 	// inside the USB removal completion is the freeze suspect. See the banner there.
-	RM_DBG("RIFFMASTER: removed virtual guitar from XAM\r\n");
+	XBOXINPUT_DBG("XBOXINPUT: removed virtual gamepad from XAM\r\n");
 	g_gipRuntime.playerIndex = 0xFF;
 	g_gipRuntime.deviceContext = 0;
 }
@@ -3281,207 +2914,6 @@ static void GipSessionRegisterWithXam(GipSessionSlot* session) {
 }
 
 //
-// ---- chunked SEND -----------------------------------------------------------
-// HOST_SECRET is 274 bytes (10 header + 256 encrypted PMS + 8 trailer) and cannot fit
-// in one 64-byte transfer, so it must be chunked the same way the device chunks its
-// replies. Encoding rules from refs/xone/bus/protocol.c:244-262, all confirmed against
-// the captured host packets:
-//
-//   first chunk : options |= CHUNK_START|CHUNK, chunk_offset varint = TOTAL length
-//   middle      : options |= CHUNK,             chunk_offset varint = running offset
-//   terminator  : zero-length chunk at offset == total
-//   the header must be padded to an EVEN length, by setting the continuation bit on
-//   the last length byte and appending a 0x00
-//
-// Capture cross-check:
-//   06 F0 04 3A 92 02   len=58, chunk=274 (0x92 0x02)      -> 6-byte header, even
-//   06 A0 04 BA 00 3A   len=58 padded (BA 00), chunk=58    -> 6-byte header, even
-//
-static int GipEncodeVarint(BYTE* buf, uint32_t val) {
-	int i;
-	for (i = 0; i < 4; i++) {
-		buf[i] = (BYTE)val;
-		if (val > 0x7F)
-			buf[i] |= 0x80;
-		val >>= 7;
-		if (!val)
-			break;
-	}
-	return i + 1;
-}
-
-static int GipVarintLen(uint32_t val) {
-	int n = 1;
-	while (val > 0x7F) { val >>= 7; n++; }
-	return n;
-}
-
-//
-// Send one chunk. Returns bytes written to the wire, or -1.
-//
-static int GipSendChunk(deviceHandle* h, BYTE cmd, BYTE opts, BYTE seq,
-                        uint32_t chunkOff, const BYTE* data, int len) {
-	if (!g_gipOutOpen || !h)
-		return -1;
-
-	BYTE* buf = g_gipOutBuf[g_gipOutBufIdx];
-	g_gipOutBufIdx = (g_gipOutBufIdx + 1) % GIP_TX_BUFS;
-
-	int i = 0;
-	buf[i++] = cmd;
-	buf[i++] = opts;
-	buf[i++] = seq;   // ALL chunks of one message share one sequence
-
-	// Decide padding up front: header = 3 + len(varint) + len(chunk varint)
-	int hdrLen = 3 + GipVarintLen((uint32_t)len) + GipVarintLen(chunkOff);
-	bool pad = (hdrLen % 2) != 0;
-
-	i += GipEncodeVarint(buf + i, (uint32_t)len);
-	if (pad) {
-		buf[i - 1] |= 0x80;      // continuation on the last length byte
-		buf[i++] = 0x00;
-	}
-	i += GipEncodeVarint(buf + i, chunkOff);
-
-	if (data && len > 0) {
-		memcpy(buf + i, data, len);
-		i += len;
-	}
-
-	SendInterruptRequest(h, &g_gipOutTrb, buf, i, (DWORD)noopCompleteHandler);
-	return i;
-}
-
-//
-// ACK-driven chunked send.
-//
-// The first attempt pushed all six chunks into the USB queue back to back. The device
-// ACKed only the first and last and the handshake stalled - it never assembled a
-// complete payload. The captured host waits for each acknowledgement before sending
-// the next chunk (15 ms and 29 ms gaps around the two ACK points), so we do the same:
-// every chunk requests an ACK, and the next one is sent from the ACK handler.
-//
-#define GIP_CHUNK_SIZE 58
-static BYTE g_gipTxBuf[320];
-static int  g_gipTxTotal = 0;
-static int  g_gipTxOff = 0;
-static BYTE g_gipTxCmd = 0;
-static bool g_gipTxActive = false;
-static BYTE g_gipTxSeq = 1;
-
-//
-// Drives the send in the three bursts the captured host uses:
-//   burst 1: chunk 0 with CHUNK_START|ACK        -> wait for ACK
-//   burst 2: all middle chunks (no ACK) then the
-//            last data chunk with ACK            -> wait for ACK
-//   burst 3: zero-length terminator (no ACK)     -> done
-//
-static void GipTxSendNext(deviceHandle* h) {
-	if (!g_gipTxActive || !h)
-		return;
-
-	if (g_gipTxOff >= g_gipTxTotal) {
-		GipSendChunk(h, g_gipTxCmd, GIP_OPT_INTERNAL | GIP_OPT_CHUNK, g_gipTxSeq,
-			(uint32_t)g_gipTxTotal, 0, 0);
-		g_gipTxActive = false;
-		RM_DBG("RIFFMASTER: -> chunked send complete (%d bytes, seq=%d)\r\n",
-			g_gipTxTotal, g_gipTxSeq);
-		return;
-	}
-
-	// Emit chunks until one that requests an acknowledgement has been sent.
-	for (;;) {
-		int n = (g_gipTxTotal - g_gipTxOff > GIP_CHUNK_SIZE)
-		        ? GIP_CHUNK_SIZE : (g_gipTxTotal - g_gipTxOff);
-		bool first = (g_gipTxOff == 0);
-		bool last = (g_gipTxOff + n >= g_gipTxTotal);
-
-		BYTE opts = GIP_OPT_INTERNAL | GIP_OPT_CHUNK;
-		if (first) opts |= GIP_OPT_CHUNK_START | GIP_OPT_ACKNOWLEDGE;
-		if (last)  opts |= GIP_OPT_ACKNOWLEDGE;
-
-		GipSendChunk(h, g_gipTxCmd, opts, g_gipTxSeq,
-			first ? (uint32_t)g_gipTxTotal : (uint32_t)g_gipTxOff,
-			g_gipTxBuf + g_gipTxOff, n);
-		g_gipTxOff += n;
-
-		if (opts & GIP_OPT_ACKNOWLEDGE)
-			return;                       // wait for the device
-		if (g_gipTxOff >= g_gipTxTotal)
-			return;
-	}
-}
-
-static void GipSendChunked(deviceHandle* h, BYTE cmd, const BYTE* data, int total) {
-	if (total > (int)sizeof(g_gipTxBuf))
-		return;
-	memcpy(g_gipTxBuf, data, total);
-	g_gipTxTotal = total;
-	g_gipTxOff = 0;
-	g_gipTxCmd = cmd;
-	// ONE sequence number for the whole message. Verified in the capture: every
-	// HOST_SECRET chunk, including the terminator, carries seq=4. Allocating a fresh
-	// sequence per chunk makes the device see six unrelated messages and it can never
-	// reassemble them - which is exactly what happened.
-	g_gipTxSeq = GipNextSeq();
-	g_gipTxActive = true;
-	RM_DBG("RIFFMASTER: -> chunked send start cmd=%02X, %d bytes, seq=%d\r\n",
-		cmd, total, g_gipTxSeq);
-	GipTxSendNext(h);
-}
-
-//
-// The device does not volunteer its hello or certificate - the host must REQUEST
-// each one. struct gip_auth_request (auth.c:71-75) is just the 6-byte handshake
-// header plus an 8-byte trailer = 14 bytes, built by gip_auth_request_pkt
-// (auth.c:186-198) with:
-//     options = REQUEST(0x02) | FROM_HOST(0x40) = 0x42
-//     length  = be16(expected_payload + sizeof(gip_auth_header_data))
-//
-// Confirmed against the capture:
-//     request CLIENT_HELLO       -> 00 42 00 02 00 54   (0x54 = 80 + 4)
-//     request CLIENT_CERTIFICATE -> 00 42 00 03 04 04   (0x404 = 1024 + 4)
-//
-#define GIP_AUTH_OPT_REQUEST 0x02
-#define GIP_AUTH_CLIENT_HELLO_LEN 80     // sizeof(gip_auth_pkt_client_hello) = 32 + 48
-#define GIP_AUTH_CERT_MAX_LEN    1024    // GIP_AUTH_CERTIFICATE_MAX_LEN
-
-static void GipSendAuthRequest(deviceHandle* h, BYTE cmd, uint16_t expectedLen) {
-	BYTE p[14];
-	memset(p, 0, sizeof(p));
-
-	uint16_t dataLen = (uint16_t)(expectedLen + 4);   // + sizeof(gip_auth_header_data)
-	p[0] = GIP_AUTH_CTX_HANDSHAKE;
-	p[1] = GIP_AUTH_OPT_REQUEST | GIP_AUTH_OPT_FROM_HOST;   // 0x42
-	p[2] = 0x00;
-	p[3] = cmd;
-	p[4] = (BYTE)(dataLen >> 8);      // big-endian
-	p[5] = (BYTE)(dataLen & 0xFF);
-	// trailer[8] stays zero
-
-	RM_DBG("RIFFMASTER: -> REQUEST auth cmd=%02X (expect %u bytes)\r\n", cmd, expectedLen);
-	GipSend(h, GIP_CMD_AUTHENTICATE, GIP_OPT_INTERNAL | GIP_OPT_ACKNOWLEDGE, p, sizeof(p));
-}
-
-//
-// Dump bytes in 32-per-line groups. The device's certificate arrives chunked and
-// is the thing we need captured in order to build the real handshake.
-//
-static void GipHexDump(const char* tag, const BYTE* d, int n) {
-	char line[3 * 32 + 1];
-	for (int off = 0; off < n; off += 32) {
-		int m = (n - off > 32) ? 32 : (n - off);
-		int c = 0;
-		for (int i = 0; i < m; i++) {
-			static const char* hx = "0123456789ABCDEF";
-			line[c++] = hx[(d[off + i] >> 4) & 0xF];
-			line[c++] = hx[d[off + i] & 0xF];
-			line[c++] = ' ';
-		}
-		line[c] = 0;
-		RM_DBG("RIFFMASTER:   %s[%03d] %s\r\n", tag, off, line);
-	}
-}
 
 //
 // ACK a chunked packet. Layout is struct gip_pkt_acknowledge,
@@ -3539,7 +2971,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 		const int total = hdr.headerLength + (int)hdr.packetLength;
 		if (total <= 0 || off + total > len) {
-			RM_DBG("RIFFMASTER: GIP truncated pkt cmd=%02X len=%u (have %d)\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: GIP truncated pkt cmd=%02X len=%u (have %d)\r\n",
 				hdr.command, hdr.packetLength, len - off);
 			break;
 		}
@@ -3562,11 +2994,11 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				((DWORD)(now - g_gipLastIdentifyTick) >= 1000);
 			if (!g_gipIdentifySent || retryIdentify) {
 				if (hdr.packetLength >= 12)
-					RM_DBG("RIFFMASTER: GIP ANNOUNCE seq=%d VID=%04X PID=%04X\r\n",
+					XBOXINPUT_DBG("XBOXINPUT: GIP ANNOUNCE seq=%d VID=%04X PID=%04X\r\n",
 						hdr.sequence,
 						payload[8] | (payload[9] << 8),
 						payload[10] | (payload[11] << 8));
-				RM_DBG("RIFFMASTER: -> sending IDENTIFY%s\r\n",
+				XBOXINPUT_DBG("XBOXINPUT: -> sending IDENTIFY%s\r\n",
 					retryIdentify ? " (retry)" : "");
 				g_gipIdentifySent = true;
 				g_gipLastIdentifyTick = now;
@@ -3582,7 +3014,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 			// Chunked descriptor reply. ACK when the device asks us to, then power on
 			// once the terminating zero-length chunk arrives.
 			g_gipIdentifyReplySeen = true;
-			RM_DBG("RIFFMASTER: GIP IDENTIFY chunk opts=%02X len=%u off=%u\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: GIP IDENTIFY chunk opts=%02X len=%u off=%u\r\n",
 				hdr.options, hdr.packetLength, hdr.chunkOffset);
 
 			if (hdr.options & GIP_OPT_ACKNOWLEDGE)
@@ -3591,7 +3023,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 			if (hdr.packetLength == 0 && !g_gipPoweredOn) {
 				g_gipPoweredOn = true;
 				XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_IDENTIFY_COMPLETE, 0);
-				RM_DBG("RIFFMASTER: -> identify complete, sending init sequence\r\n");
+				XBOXINPUT_DBG("XBOXINPUT: -> identify complete, sending init sequence\r\n");
 
 				if (IsPowerA1414134(g_gipVendorId, g_gipProductId)) {
 					// The early POWER transfer is normally complete before IDENTIFY can
@@ -3605,7 +3037,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				}
 
 				// Replay what the Windows host sent, in order, from the captured
-				// enumeration (docs/gip_riffmaster.md section 5 stage 2). Previously we
+				// enumeration (docs/GIP protocol notes section 5 stage 2). Previously we
 				// sent only POWER ON and the device went quiet then disconnected.
 
 				// 1. 15-byte POWER packet with ASCII "US" at payload offset 7-8.
@@ -3628,14 +3060,12 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				static const BYTE led[3] = { 0x00, 0x01, 0x14 };
 				GipSend(g_gipExt.deviceHandle, GIP_CMD_LED, GIP_OPT_INTERNAL, led, sizeof(led));
 
-				RM_DBG("RIFFMASTER: -> sent locale, POWER ON, LED\r\n");
+				XBOXINPUT_DBG("XBOXINPUT: -> sent locale, POWER ON, LED\r\n");
 
-				// Standard Microsoft gamepads stream input after IDENTIFY/POWER; unlike
-				// the RiffMaster dongle they do not require the guitar RSA exchange.
+				// Standard wired gamepads become ready after IDENTIFY and POWER.
 				if (!XboxInputRuntimeIsReady(&g_gipRuntime)) {
 					XboxInputRuntimeSetReady(&g_gipRuntime, true);
-					// Gamepads skip the guitar authentication sequence. Reaching this
-					// point is therefore a successful session and may refill the safe
+					// Reaching this point is a successful session and may refill the safe
 					// reconnect budget after a sleep/wake bounce.
 					g_gipClaimAttempts = 0;
 					GipRegisterWithXam();
@@ -3645,166 +3075,17 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 
 		case GIP_CMD_STATUS:
 			if (hdr.packetLength >= 1) {
-				RM_DBG("RIFFMASTER: GIP STATUS 0x%02X (%s)\r\n",
+				XBOXINPUT_DBG("XBOXINPUT: GIP STATUS 0x%02X (%s)\r\n",
 					payload[0], (payload[0] & 0x80) ? "connected" : "DISCONNECTED");
-
-				// The captured host starts auth right after the first connected
-				// STATUS (docs/gip_riffmaster.md section 5: STATUS at +1.7379,
-				// first auth packet at +1.7540). Match that ordering.
-				// Fallback trigger. Deliberately NOT gated on g_gipPoweredOn -
-				// that gate is what silently blocked the first attempt.
-				if ((payload[0] & 0x80) && !g_gipAuthStarted) {
-					RM_DBG("RIFFMASTER: (auth starting from STATUS path)\r\n");
-					g_gipAuthStarted = true;
-					g_gipAuthChunkTotal = 0;
-					g_gipCertBytes = 0;
-					g_gipAuthStage = 0;
-					GipSendHostHello(g_gipExt.deviceHandle);
-				}
 			}
 			break;
 
 		case GIP_CMD_AUTHENTICATE:
-			// Response to HOST_HELLO. Expect CLIENT_HELLO (0x02) then a chunked
-			// CLIENT_CERTIFICATE (0x03) containing the device's RSA public key.
-			if (hdr.options & GIP_OPT_CHUNK) {
-				// Chunked: the inner header is only present on the first chunk.
-				if (hdr.options & GIP_OPT_CHUNK_START)
-					g_gipAuthChunkTotal = hdr.chunkOffset;
-				// Certificate hex is NOT dumped any more. Dumping ~30 lines per run
-				// saturated the xbWatson channel and silently dropped later output -
-				// including two certificate chunks and the entire RSA self-test result.
-				// The certificate is already captured in reference/riffmaster_cert.der.
-				RM_DBG("RIFFMASTER: AUTH chunk opts=%02X len=%u off=%u total=%u\r\n",
-					hdr.options, hdr.packetLength, hdr.chunkOffset, g_gipAuthChunkTotal);
-				// Accumulate at the reported chunk offset rather than appending, so a
-				// dropped or reordered chunk cannot silently shift the whole buffer.
-				{
-					uint32_t at = (hdr.options & GIP_OPT_CHUNK_START) ? 0 : hdr.chunkOffset;
-					if (at + hdr.packetLength <= GIP_CERT_BUF_MAX) {
-						memcpy(g_gipCertBuf + at, payload, hdr.packetLength);
-						if ((int)(at + hdr.packetLength) > g_gipCertBytes)
-							g_gipCertBytes = (int)(at + hdr.packetLength);
-					}
-				}
-
-				if (hdr.options & GIP_OPT_ACKNOWLEDGE) {
-					// Reuse the identify ACK path - same gip_pkt_acknowledge layout.
-					uint32_t saved = g_gipChunkTotal;
-					g_gipChunkTotal = g_gipAuthChunkTotal;
-					GipSendAck(g_gipExt.deviceHandle, &hdr);
-					g_gipChunkTotal = saved;
-				}
-				if (hdr.packetLength == 0) {
-					RM_DBG("RIFFMASTER: *** AUTH stage %d complete, %d bytes ***\r\n",
-						g_gipAuthStage, g_gipCertBytes);
-					// A completed chunked reply advances the sequence.
-					if (g_gipAuthStage == 1) {
-						// CLIENT_HELLO payload: 10-byte header, then random[32].
-						if (g_gipCertBytes >= 42)
-							memcpy(g_gipClientRandom, g_gipCertBuf + 10, 32);
-						// Received packet -> transcript gets [6, len).
-						GipTranscriptAdd(&g_gipTranscript, g_gipCertBuf + 6, g_gipCertBytes - 6);
-						g_gipAuthStage = 2;
-						g_gipCertBytes = 0;
-						GipSendAuthRequest(g_gipExt.deviceHandle,
-							GIP_AUTH_CMD_CLIENT_CERT, GIP_AUTH_CERT_MAX_LEN);
-					}
-					else if (g_gipAuthStage == 2) {
-						// Received packet -> transcript gets [6, len). Must happen
-						// BEFORE HOST_SECRET, which is hashed after it.
-						GipTranscriptAdd(&g_gipTranscript, g_gipCertBuf + 6,
-							g_gipCertBytes - 6);
-						RM_DBG("RIFFMASTER: *** CERTIFICATE RECEIVED - dumped above ***\r\n");
-						g_gipAuthStage = 3;
-						GipRsaSelfTest();
-					}
-					else if (g_gipAuthStage == 6) {
-						// CLIENT_FINISH received. We do not verify it - the device is
-						// the party being authenticated, and it has already accepted
-						// everything we sent. Tell it the handshake is done.
-						//
-						// gip_auth_send_complete (refs/xone/auth/auth.c:489-497):
-						//   { context = CONTROL(0x01), control = COMPLETE(0x00) }
-						//   2 bytes, sent WITHOUT requesting an acknowledgement.
-						static const BYTE done[2] = { 0x01, 0x00 };
-						RM_DBG("RIFFMASTER: *** CLIENT_FINISH received (%d bytes) ***\r\n",
-							g_gipCertBytes);
-						RM_DBG("RIFFMASTER: -> sending AUTH COMPLETE\r\n");
-						GipSend(g_gipExt.deviceHandle, GIP_CMD_AUTHENTICATE,
-							GIP_OPT_INTERNAL, done, sizeof(done));
-						g_gipAuthStage = 7;
-						RM_LOG("RIFFMASTER: *** AUTH HANDSHAKE COMPLETE ***\r\n");
-						// A connection that got all the way to auth is a REAL one, so
-						// refresh the claim budget here rather than in teardown. See the
-						// banner on GIP_CLAIM_MAX_ATTEMPTS: resetting on teardown let a
-						// disconnect bounce-storm re-claim without limit.
-						g_gipClaimAttempts = 0;
-						GipRegisterWithXam();
-					}
-				}
-			}
-			else if (hdr.packetLength >= 6) {
-				RM_DBG("RIFFMASTER: AUTH ctx=%02X opt=%02X err=%02X cmd=%02X len=%u (gip len=%u)\r\n",
-					payload[0], payload[1], payload[2], payload[3],
-					(payload[4] << 8) | payload[5], hdr.packetLength);
-				GipHexDump("auth", payload, (int)hdr.packetLength);
-				if (hdr.options & GIP_OPT_ACKNOWLEDGE)
-					GipSendAck(g_gipExt.deviceHandle, &hdr);
-
-				if (payload[2] != 0x00)
-					RM_LOG("RIFFMASTER: !!! device reported auth error 0x%02X !!!\r\n", payload[2]);
-
-				// Device acknowledged HOST_HELLO at the auth layer
-				// (capture: 00 C1 00 01 00 00). Now request its hello.
-				if (payload[3] == GIP_AUTH_CMD_HOST_HELLO && g_gipAuthStage == 0) {
-					g_gipAuthStage = 1;
-					g_gipCertBytes = 0;
-					GipSendAuthRequest(g_gipExt.deviceHandle,
-						GIP_AUTH_CMD_CLIENT_HELLO, GIP_AUTH_CLIENT_HELLO_LEN);
-				}
-				// The device answers each completed step with a short zero-length
-				// packet. Drive the tail of the handshake off those, rather than
-				// firing everything back to back and outrunning its RSA decrypt.
-				else if (g_gipAuthStage == 4 && g_gipHostFinishReady) {
-					g_gipAuthStage = 5;
-					g_gipHostFinishReady = false;
-					RM_DBG("RIFFMASTER: -> sending HOST_FINISH (50 bytes)\r\n");
-					// HOST_FINISH also contributes to the transcript: [6, 6+36).
-					GipTranscriptAdd(&g_gipTranscript, g_gipHostFinish + 6, 36);
-					GipSend(g_gipExt.deviceHandle, GIP_CMD_AUTHENTICATE,
-						GIP_OPT_INTERNAL | GIP_OPT_ACKNOWLEDGE,
-						g_gipHostFinish, 50);
-				}
-				else if (g_gipAuthStage == 5) {
-					// HOST_FINISH accepted - now ask for CLIENT_FINISH.
-					// sizeof(gip_auth_pkt_client_finish) = 32 + 32 = 64, so the
-					// request length is 68 (0x44), matching the capture.
-					g_gipAuthStage = 6;
-					g_gipCertBytes = 0;
-					GipSendAuthRequest(g_gipExt.deviceHandle,
-						GIP_AUTH_CMD_CLIENT_FINISH, 64);
-				}
-			}
-			else {
-				RM_DBG("RIFFMASTER: AUTH short pkt len=%u\r\n", hdr.packetLength);
-			}
 			break;
 
 		case GIP_CMD_VIRTUAL_KEY:
-			{
-				const bool wasDown = g_gipRuntime.guideDown;
-				if (XboxInputApplyGipGuidePayload(payload, (int)hdr.packetLength,
-					&g_gipRuntime.guideDown, &g_gipRuntime.guidePending)) {
-					const bool down = g_gipRuntime.guideDown;
-				// Ignore any repeated DOWN packet while the physical button remains
-				// held. Otherwise it can be interpreted as a second dashboard press,
-				// immediately closing the Guide that the first one opened.
-				if (down && !wasDown)
-					g_gipGuideOverlayOpen = !g_gipGuideOverlayOpen;
-				RM_DBG("RIFFMASTER: GIP GUIDE %s\r\n", payload[0] ? "DOWN" : "UP");
-				}
-			}
+			XboxInputApplyGipGuidePayload(payload, (int)hdr.packetLength,
+				&g_gipRuntime.guideDown, &g_gipRuntime.guidePending);
 			break;
 
 		case GIP_CMD_INPUT:
@@ -3830,24 +3111,18 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				g_gipInputsSeen++;
 				// Rate-limited: these arrive at ~40 Hz and would flood the log.
 				if (g_gipInputsSeen <= 3 || (g_gipInputsSeen % 400) == 0)
-					RM_DBG("XBOXINPUT: GIP INPUT #%d btn=%04X\r\n",
+					XBOXINPUT_DBG("XBOXINPUT: GIP INPUT #%d btn=%04X\r\n",
 						g_gipInputsSeen, g_gipRuntime.state.buttons);
 			}
 			break;
 
 		case GIP_CMD_ACKNOWLEDGE:
-			// Drives the chunked send: one chunk per acknowledgement.
-			if (g_gipTxActive) {
-				GipTxSendNext(g_gipExt.deviceHandle);
-			}
-			else {
-				RM_DBG("RIFFMASTER: GIP ACK seq=%d len=%u\r\n",
-					hdr.sequence, hdr.packetLength);
-			}
+			XBOXINPUT_DBG("XBOXINPUT: GIP ACK seq=%d len=%u\r\n",
+				hdr.sequence, hdr.packetLength);
 			break;
 
 		default:
-			RM_DBG("RIFFMASTER: GIP cmd=%02X opts=%02X seq=%d len=%u\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: GIP cmd=%02X opts=%02X seq=%d len=%u\r\n",
 				hdr.command, hdr.options, hdr.sequence, hdr.packetLength);
 			break;
 		}
@@ -3857,7 +3132,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 }
 
 // Minimal gamepad-only GIP path for additional controller sessions.  Authentication
-// packets are intentionally not shared with the legacy RiffMaster path: official
+// packets are intentionally not shared with the gamepad path: official
 // wired Microsoft gamepads become ready after IDENTIFY/POWER and stream INPUT.
 static void GipSessionSendAck(GipSessionSlot* session, const GipHeader* in) {
 	uint32_t total = (in->options & GIP_OPT_CHUNK_START) ? in->chunkOffset : 0;
@@ -3980,7 +3255,7 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	//
 	// So: a bounded number of consecutive failures, then stop for good. Bounded
 	// rather than zero-tolerance because a single transient error on an interrupt
-	// endpoint should not permanently kill a working guitar.
+	// endpoint should not permanently kill a working controller.
 	// -----------------------------------------------------------------------
 	// `fix1` bounded ERROR completions only, and did not survive. So either the reads
 	// are not failing at all, or the loop is not the mechanism. The likely miss:
@@ -4009,14 +3284,14 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 		static bool reported = false;
 		if (!reported) {
 			reported = true;
-			RM_LOG("RIFFMASTER: read loop STOPPED after %d unproductive completions "
+			XBOXINPUT_LOG("XBOXINPUT: read loop STOPPED after %d unproductive completions "
 				"(last status 0x%08X) - disconnect guard fired\r\n",
 				GIP_MAX_CONSECUTIVE_READ_ERRORS, status);
 		}
 		return status;
 	}
 	else if (status != 0 && g_gipPacketsSeen < 4) {
-		RM_DBG("RIFFMASTER: GIP read status 0x%08X\r\n", status);
+		XBOXINPUT_DBG("XBOXINPUT: GIP read status 0x%08X\r\n", status);
 	}
 
 	if (!ext->deviceHandle)
@@ -4048,7 +3323,7 @@ static int32_t GipStartPrimaryRead(HidControllerExtension* ext, uint16_t packetS
 	if (!ext || !ext->deviceHandle ||
 		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return -1;
-#ifdef RIFFMASTER_NO_READ
+#ifdef XBOXINPUT_NO_READ
 	UNREFERENCED_PARAMETER(packetSize);
 	return 0;
 #else
@@ -4093,7 +3368,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return status;
 
-	RM_LOG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
+	XBOXINPUT_LOG("XBOXINPUT: SET_CONFIGURATION completed status=0x%08X\r\n", status);
 	if (status != 0)
 	{
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 50, status);
@@ -4114,7 +3389,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	uint16_t pkt = endpoints->maximumPacketSize;
 	BYTE interval = endpoints->interval;
 
-	RM_DBG("RIFFMASTER: opening EP %02X maxPacket=%d interval=%d\r\n", epAddr, pkt, interval);
+	XBOXINPUT_DBG("XBOXINPUT: opening EP %02X maxPacket=%d interval=%d\r\n", epAddr, pkt, interval);
 
 	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, endpoints->transferType,
 		epAddr, pkt, interval, (DWORD*)&ext->interruptTrb);
@@ -4122,10 +3397,10 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		((DWORD)epAddr << 24) | ((DWORD)pkt << 8) | (NT_ERROR(s) ? 0x80 : interval));
 	if (NT_ERROR(s)) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 60, s);
-		RM_LOG("RIFFMASTER: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
+		XBOXINPUT_LOG("XBOXINPUT: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
 		return s;
 	}
-	RM_LOG("RIFFMASTER: *** interrupt IN endpoint OPEN - starting GIP reads ***\r\n");
+	XBOXINPUT_LOG("XBOXINPUT: *** interrupt IN endpoint OPEN - starting GIP reads ***\r\n");
 	XboxInputSetDiagStage(60);
 
 	// Open the matching profile-owned OUT endpoint too - without it we can never
@@ -4139,7 +3414,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		g_gipOutOpen = !NT_ERROR(os);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_INTERRUPT_OUT_OPEN,
 			((DWORD)outAddr << 24) | ((DWORD)outPkt << 8) | (NT_ERROR(os) ? 0x80 : outInterval));
-		RM_LOG("RIFFMASTER: interrupt OUT EP %02X -> 0x%08X %s\r\n",
+		XBOXINPUT_LOG("XBOXINPUT: interrupt OUT EP %02X -> 0x%08X %s\r\n",
 			outAddr, os, g_gipOutOpen ? "OK" : "FAILED");
 		if (g_gipOutOpen && IsPowerA1414134(g_gipVendorId, g_gipProductId)) {
 			// 2015-era Xbox One firmware may not ANNOUNCE until the host powers it
@@ -4149,15 +3424,15 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		}
 	}
 
-#ifdef RIFFMASTER_NO_READ
+#ifdef XBOXINPUT_NO_READ
 	// L7-noread: claim the device and open all three endpoints exactly as normal, then
 	// never queue a single interrupt read. Nothing ever completes, so GipInterruptComplete
 	// can never run and the read loop cannot exist in any form.
 	//
 	// This is the split that should have come before any attempted fix: it separates
 	// "having claimed the device and opened its endpoints" from "servicing it". The
-	// guitar will not work - no reads means no input and no auth.
-	RM_LOG("RIFFMASTER: interrupt reads NOT started (noread variant)\r\n");
+	// controller will not work - no reads means no input or initialization.
+	XBOXINPUT_LOG("XBOXINPUT: interrupt reads NOT started (noread variant)\r\n");
 	return 0;
 #endif
 	if (g_gipOutOpen &&
@@ -4303,7 +3578,7 @@ static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
 }
 
 int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
-	// This is the ONLY export that fires for the RiffMaster dongle, so identify the
+	// This is the ONLY export that fires for the GIP controller, so identify the
 	// device here rather than assuming. Nobody called UsbdGetDeviceDescriptor for it,
 	// but the handle is live at this point, so we can ask ourselves.
 	//
@@ -4312,25 +3587,25 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	usb_device_descriptor* dd = UsbdGetDeviceDescriptor ? UsbdGetDeviceDescriptor(h) : 0;
 	usb_interface_descriptor* id = UsbdGetInterfaceDescriptor ? UsbdGetInterfaceDescriptor(h) : 0;
 
-	RM_DBG("RIFFMASTER: ADDCOMPLETE handle=%p status=0x%08X (%s) driver=%p\r\n",
+	XBOXINPUT_DBG("XBOXINPUT: ADDCOMPLETE handle=%p status=0x%08X (%s) driver=%p\r\n",
 		h, status, (status == 0) ? "CLAIMED" : "not claimed",
 		h ? h->driver : 0);
 
 	if (dd)
-		RM_DBG("RIFFMASTER:   dev VID=%04X PID=%04X class=%02X/%02X/%02X\r\n",
+		XBOXINPUT_DBG("XBOXINPUT:   dev VID=%04X PID=%04X class=%02X/%02X/%02X\r\n",
 			swap_endianness_16(dd->idVendor), swap_endianness_16(dd->idProduct),
 			dd->bDeviceClass, dd->bDeviceSubClass, dd->bDeviceProtocol);
 	else
-		RM_DBG("RIFFMASTER:   dev descriptor NULL\r\n");
+		XBOXINPUT_DBG("XBOXINPUT:   dev descriptor NULL\r\n");
 
 	if (id)
-		RM_DBG("RIFFMASTER:   iface #%d alt=%d nEP=%d class=%02X/%02X/%02X%s\r\n",
+		XBOXINPUT_DBG("XBOXINPUT:   iface #%d alt=%d nEP=%d class=%02X/%02X/%02X%s\r\n",
 			id->bInterfaceNumber, id->bAlternateSetting, id->bNumEndpoints,
 			id->bInterfaceClass, id->bInterfaceSubClass, id->bInterfaceProtocol,
 			(id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
 			 id->bInterfaceProtocol == 0xD0) ? "   <<< GIP" : "");
 	else
-		RM_DBG("RIFFMASTER:   iface descriptor NULL\r\n");
+		XBOXINPUT_DBG("XBOXINPUT:   iface descriptor NULL\r\n");
 
 #ifdef XBOXINPUT_COMPAT_PROBE
 	// Observation only: the build must be safe to give to users with unknown
@@ -4409,16 +3684,16 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	// in HidAddDeviceHook: attach a driver extension, then complete with status 0.
 	//
 	// Conditions are deliberately narrow. Only the GIP data interface of the
-	// RiffMaster dongle, only when the kernel has already given up on it.
+	// GIP controller, only when the kernel has already given up on it.
 	// ---------------------------------------------------------------------
 	// Breadcrumb #1. Fires for EVERY device the core gives up on, ours or not, so a
 	// replug that never re-enumerates is distinguishable from one we declined to claim.
-	RM_TRACE("RIFFMASTER: TRACE ADDCOMPLETE h=%p status=0x%08X\r\n", h, status);
-#ifdef RIFFMASTER_CLAIM_ONCE
+	XBOXINPUT_TRACE_LOG("XBOXINPUT: TRACE ADDCOMPLETE h=%p status=0x%08X\r\n", h, status);
+#ifdef XBOXINPUT_CLAIM_ONCE
 	// L7-once: claim the dongle exactly ONE time per boot, ever. Every later arrival
 	// is left unclaimed, i.e. treated exactly as a no-plugin boot treats it.
 	//
-	// Turning the guitar off makes the dongle bounce off and back onto USB ~6 times.
+	// Turning the controller off makes the dongle bounce off and back onto USB ~6 times.
 	// Each arrival currently re-enters the claim with the SAME static g_gipExt, and
 	// re-queues TRBs the kernel may still own from the previous incarnation. This
 	// build removes the storm entirely without touching teardown, so it separates
@@ -4449,16 +3724,16 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
 				((DWORD)vid << 16) | pid,
 				((DWORD)id->bInterfaceNumber << 8) | id->bNumEndpoints);
-#ifdef RIFFMASTER_CLAIM_ONCE
+#ifdef XBOXINPUT_CLAIM_ONCE
 			s_claimedOnce = true;
 #endif
-			// Breadcrumb #2. Promoted from RM_DBG: in the `noread` run nothing at all
+			// Breadcrumb #2. Promoted from XBOXINPUT_DBG: in the `noread` run nothing at all
 			// appeared in xbWatson after a replug, and because these were compiled out
 			// there was no way to tell "the dongle never re-enumerated" from "it was
 			// re-claimed silently". Under `trace` the claim is always visible.
-			RM_TRACE("RIFFMASTER: TRACE CLAIM ATTEMPT %d handle=%p\r\n",
+			XBOXINPUT_TRACE_LOG("XBOXINPUT: TRACE CLAIM ATTEMPT %d handle=%p\r\n",
 				g_gipClaimAttempts, h);
-			RM_DBG("RIFFMASTER: *** CLAIM ATTEMPT %d on GIP dongle (handle %p) ***\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: *** CLAIM ATTEMPT %d on GIP dongle (handle %p) ***\r\n",
 				g_gipClaimAttempts, h);
 
 			// Statically allocated rather than new'd: we do not know the IRQL this
@@ -4469,7 +3744,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// -------------------------------------------------------------------
 			// THE CLAIM. `claimonly` proved these two lines alone are sufficient to
 			// freeze the console on removal - no endpoints, no transfers, no XAM,
-			// no auth, and it still dies.
+			// no initialization, and it still dies.
 			//
 			// What they do is tell the USB core that a driver claimed this device,
 			// when none did. The core was iterating drivers, every one declined, and
@@ -4484,7 +3759,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// Mass storage's driver pointer is 0x801A87E0 - kernel .data, a real driver
 			// object. Ours points into the plugin at 0x81F0xxxx.
 			//
-			// RIFFMASTER_NO_CLAIM tests the obvious alternative: do not claim at all.
+			// XBOXINPUT_NO_CLAIM tests the obvious alternative: do not claim at all.
 			// Let the core record the device as unclaimed exactly as it does with no
 			// plugin loaded - the configuration that is PROVEN to survive removal, by
 			// every one of ladder levels 0-6 and by the no-plugin control - and drive
@@ -4492,7 +3767,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// way; the open question is only whether the core permits endpoint
 			// operations on a device it considers unowned.
 			// -------------------------------------------------------------------
-#if defined(RIFFMASTER_NO_CLAIM_LATE)
+#if defined(XBOXINPUT_NO_CLAIM_LATE)
 			// noclaim3: report NOTHING to the core yet. Open the endpoints and queue
 			// SET_CONFIGURATION while the device is still mid-claim from the core's
 			// point of view, and only report the failure status on the way out.
@@ -4503,11 +3778,11 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// the device is written off may still run, and its completion chain
 			// (interrupt endpoints, reads, auth) may keep running with it.
 			int r = 0;
-#elif defined(RIFFMASTER_NO_CLAIM)
+#elif defined(XBOXINPUT_NO_CLAIM)
 			int r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
-			RM_LOG("RIFFMASTER: NOT claiming - passed original status 0x%08X through, "
+			XBOXINPUT_LOG("XBOXINPUT: NOT claiming - passed original status 0x%08X through, "
 				"driver stays %p\r\n", status, h->driver);
-#elif defined(RIFFMASTER_KEEP_DRIVER)
+#elif defined(XBOXINPUT_KEEP_DRIVER)
 			// Claim the device - so the core keeps scheduling transfers for it - but do
 			// NOT overwrite h->driver. The fabricated extension was the fatal half of
 			// the old claim; completing with status 0 by itself may be harmless.
@@ -4523,7 +3798,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// to find rather than replacing it with a pointer into our plugin.
 			void* before = h->driver;
 			int r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, 0);
-			RM_LOG("RIFFMASTER: claimed WITHOUT touching driver - was %p, now %p\r\n",
+			XBOXINPUT_LOG("XBOXINPUT: claimed WITHOUT touching driver - was %p, now %p\r\n",
 				before, h->driver);
 			XboxInputSetDiagStage(30);
 #else
@@ -4531,11 +3806,11 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 
 			int r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, 0);
 #endif
-			RM_DBG("RIFFMASTER: claim AddDeviceComplete(status=0) returned 0x%08X, driver now=%p\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: claim AddDeviceComplete(status=0) returned 0x%08X, driver now=%p\r\n",
 				r, h->driver);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_CLAIM_COMPLETE, r);
 
-#ifdef RIFFMASTER_CLAIM_ONLY
+#ifdef XBOXINPUT_CLAIM_ONLY
 			// L7-claimonly: take the device and stop. No default endpoint, no
 			// SET_CONFIGURATION, no interrupt endpoints, no transfers ever.
 			//
@@ -4544,21 +3819,21 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// fault is in OPENING endpoints on a device we claimed this way. If it
 			// freezes, the bare claim is sufficient and the problem is that the core
 			// believes a driver owns a device that has none.
-			RM_LOG("RIFFMASTER: claimed and stopped (claimonly variant)\r\n");
+			XBOXINPUT_LOG("XBOXINPUT: claimed and stopped (claimonly variant)\r\n");
 			return r;
 #endif
 			NTSTATUS s = UsbdOpenDefaultEndpoint(h, (DWORD*)&g_gipExt.controlTrb);
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_DEFAULT_ENDPOINT_OPEN, s);
-			// RM_LOG, not RM_DBG: under NO_CLAIM this is the whole question - whether
+			// XBOXINPUT_LOG, not XBOXINPUT_DBG: under NO_CLAIM this is the whole question - whether
 			// the core will open an endpoint on a device it considers unowned.
-			RM_LOG("RIFFMASTER: UsbdOpenDefaultEndpoint -> 0x%08X %s\r\n",
+			XBOXINPUT_LOG("XBOXINPUT: UsbdOpenDefaultEndpoint -> 0x%08X %s\r\n",
 				s, NT_ERROR(s) ? "FAILED" : "OK");
 			XboxInputSetDiagStage(40);
 			if (NT_ERROR(s))
 				return r;
 
 			// Bring the device up. Per the captured enumeration
-			// (docs/gip_riffmaster.md section 5) SET_CONFIGURATION is the last control
+			// (docs/GIP protocol notes section 5) SET_CONFIGURATION is the last control
 			// transfer; everything after it is GIP over the interrupt endpoints, and the
 			// device then sends ANNOUNCE (0x02) unprompted.
 			int32_t q = SendControlRequest(h, &g_gipExt.controlTrb,
@@ -4574,13 +3849,13 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// So the queue call accepts the transfer either way, and the difference is
 			// purely whether the core ever SERVICES it. Do not read this as success or
 			// failure - it is only here to prove the call was reached and returned.
-			RM_LOG("RIFFMASTER: SET_CONFIGURATION queued -> 0x%08X (not a status)\r\n", q);
+			XBOXINPUT_LOG("XBOXINPUT: SET_CONFIGURATION queued -> 0x%08X (not a status)\r\n", q);
 
-#ifdef RIFFMASTER_NO_CLAIM_LATE
+#ifdef XBOXINPUT_NO_CLAIM_LATE
 			// Only now tell the core the device was not claimed - after our endpoints
 			// are open and the control transfer is already queued.
 			r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
-			RM_LOG("RIFFMASTER: deferred unclaim - reported 0x%08X after setup, driver=%p\r\n",
+			XBOXINPUT_LOG("XBOXINPUT: deferred unclaim - reported 0x%08X after setup, driver=%p\r\n",
 				status, h->driver);
 #endif
 			return r;
@@ -4606,10 +3881,10 @@ NTSTATUS UsbdOpenDefaultEndpointHook(deviceHandle* h, DWORD* ep) {
 // hypothesis consistent with all six observations:
 //
 //   killtest (VERBOSE, never claims) - ProbeLog DbgPrint here -> FROZE
-//   noreset  (no USB reset/patches)  - RM_LOG DbgPrints here  -> FROZE
-//   giponly  (no HID detours/thread) - RM_LOG DbgPrints here  -> FROZE
-//   nonotify (no XAM notify patches) - RM_LOG DbgPrints here  -> FROZE
-//   fixremove(h->driver detached)    - RM_LOG DbgPrints here  -> FROZE
+//   noreset  (no USB reset/patches)  - XBOXINPUT_LOG DbgPrints here  -> FROZE
+//   giponly  (no HID detours/thread) - XBOXINPUT_LOG DbgPrints here  -> FROZE
+//   nonotify (no XAM notify patches) - XBOXINPUT_LOG DbgPrints here  -> FROZE
+//   fixremove(h->driver detached)    - XBOXINPUT_LOG DbgPrints here  -> FROZE
 //   NO PLUGIN                        - nothing prints here    -> SURVIVES
 //
 // Every earlier hypothesis (bugcheck patches, USB reset, HID detours, mapping
@@ -4617,8 +3892,8 @@ NTSTATUS UsbdOpenDefaultEndpointHook(deviceHandle* h, DWORD* ep) {
 // that removed it and froze anyway - and every one of those builds still logged
 // from in here.
 //
-// All logging on this path is therefore RM_DBG, which compiles to nothing unless
-// RIFFMASTER_VERBOSE is defined. If you need to trace teardown, set a flag here and
+// All logging on this path is therefore XBOXINPUT_DBG, which compiles to nothing unless
+// XBOXINPUT_VERBOSE is defined. If you need to trace teardown, set a flag here and
 // print it later from a safe context - do not print from inside this call.
 // ---------------------------------------------------------------------------
 NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
@@ -4627,9 +3902,9 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 	// to first on removal, walking the g_gipExt we handed it at claim time. That would
 	// explain why `passive` (which does nothing here) froze identically, and it would
 	// mean no amount of work inside this function can help.
-	RM_TRACE("RIFFMASTER: TRACE REMOVE ENTER h=%p ours=%d\r\n",
+	XBOXINPUT_TRACE_LOG("XBOXINPUT: TRACE REMOVE ENTER h=%p ours=%d\r\n",
 		h, (h && h == g_gipExt.deviceHandle) ? 1 : 0);
-#ifdef RIFFMASTER_PASSIVE_REMOVE
+#ifdef XBOXINPUT_PASSIVE_REMOVE
 	// L7-passive: claim and drive the device exactly as normal, but do NOTHING on
 	// removal — no state reset, no XAM unregister, no endpoint work, just hand
 	// straight to the kernel. Leaks a stale extension by design; this build is a
@@ -4687,24 +3962,16 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 	// cleaning up after us, and GipInterruptComplete kept re-arming
 	// UsbdQueueAsyncTransfer on a handle the kernel had already destroyed - a
 	// use-after-free in a completion callback, re-armed forever. That is the hard
-	// freeze seen on guitar disconnect.
+	// freeze seen on controller disconnect.
 	//
 	// Stop the read loop FIRST, then release our references.
 	// ---------------------------------------------------------------------
 	if (h && h == g_gipExt.deviceHandle) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
 			g_gipRuntime.playerIndex);
-		RM_DBG("RIFFMASTER: *** device removed - tearing down GIP state ***\r\n");
+		XBOXINPUT_DBG("XBOXINPUT: *** device removed - tearing down GIP state ***\r\n");
 
-		// 0. Stop presenting as a live controller IMMEDIATELY.
-		//    Both XAM hooks gate on (g_gipUserIndex != 0xFF && g_gipAuthStage == 7).
-		//    Clearing the stage first means that from this instruction onwards they
-		//    fall through to the originals instead of answering "connected guitar"
-		//    with stale state for a device that is being destroyed. XAM polls
-		//    capabilities several times per 100 ms, so this window matters.
-		g_gipAuthStage = 0;
-		g_gipTxActive = false;
-		g_gipHostFinishReady = false;
+		// Stop presenting as a live controller before releasing USB state.
 
 		// 1. Stop the re-arm loop and the send path. Null the handle before anything
 		//    else so a completion that fires mid-teardown cannot re-arm.
@@ -4738,8 +4005,8 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		//    original reason for cleaning up here. The endpoints belong to a device the
 		//    kernel is destroying anyway, so it reclaims them - there is nothing to leak.
 		//
-		//    Set RIFFMASTER_CLOSE_ENDPOINTS_ON_REMOVE to restore the old behaviour.
-#ifdef RIFFMASTER_CLOSE_ENDPOINTS_ON_REMOVE
+		//    Set XBOXINPUT_CLOSE_ENDPOINTS_ON_REMOVE to restore the old behaviour.
+#ifdef XBOXINPUT_CLOSE_ENDPOINTS_ON_REMOVE
 		if (UsbdQueueCloseEndpoint) {
 			UsbdQueueCloseEndpoint(dead, &g_gipExt.interruptTrb);
 			UsbdQueueCloseEndpoint(dead, &g_gipOutTrb);
@@ -4747,7 +4014,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		if (UsbdQueueCloseDefaultEndpoint)
 			UsbdQueueCloseDefaultEndpoint(dead, (DWORD*)&g_gipExt.controlTrb);
 #endif
-		RM_DBG("RIFFMASTER: endpoints closed\r\n");
+		XBOXINPUT_DBG("XBOXINPUT: endpoints closed\r\n");
 
 		// 3. Mark cleanup done, then DETACH our extension from the handle.
 		//
@@ -4771,7 +4038,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		dead->driver = 0;
 
 		// 4. Release the XAM virtual controller.
-		//    This was MISSING: the guitar stayed registered after the device was
+		//    This was MISSING: the controller stayed registered after the device was
 		//    gone, so XAM kept a controller bound to a dead device indefinitely.
 		const uint8_t removedUser = g_gipRuntime.playerIndex;
 		GipUnregisterFromXam();
@@ -4787,15 +4054,12 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			g_gipIdentifyReplySeen = false;
 			g_gipLastIdentifyTick = 0;
 			g_gipPoweredOn = false;
-		g_gipAuthStarted = true;
 		g_gipGuideOverlayOpen = false;
 		g_gipChunkTotal = 0;
-		g_gipAuthChunkTotal = 0;
-		g_gipCertBytes = 0;
 		// g_gipClaimAttempts is deliberately NOT reset here. Refilling the budget on
 		// every teardown let a disconnect bounce-storm re-claim without limit, which is
 		// what re-queues a TRB the kernel still owns. Only a connection that reaches
-		// AUTH HANDSHAKE COMPLETE refills it. See GIP_CLAIM_MAX_ATTEMPTS.
+		// A fully ready connection refills it. See GIP_CLAIM_MAX_ATTEMPTS.
 		g_gipPacketsSeen = 0;
 		g_gipInputsSeen = 0;
 		g_gipSeq = 1;
@@ -4804,7 +4068,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		g_gipCapsLogged = 0;
 		g_gipCaps2Logged = 0;
 
-		RM_DBG("RIFFMASTER: teardown done, ready for replug\r\n");
+		XBOXINPUT_DBG("XBOXINPUT: teardown done, ready for replug\r\n");
 
 		// ===================================================================
 		// THE DISCONNECT FIX. `[VERIFIED on hardware 2026-08-08]`
@@ -4821,7 +4085,7 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		// Then `claimonly`, whose entire contribution is:
 		//     h->driver = &g_gipExt;
 		//     UsbdAddDeviceComplete(h, 0);
-		// froze with no endpoints, no transfers, no XAM and no auth. And `keepdriver`,
+		// froze with no endpoints, no transfers, no XAM and no initialization. And `keepdriver`,
 		// which claims but never writes h->driver (it stayed 00000000), froze too. So
 		// the fatal act is reporting the claim, not the fabricated pointer: the core
 		// then believes a driver owns a device that driver never registered, and on
@@ -4832,17 +4096,17 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		// never services them, so SET_CONFIGURATION never completes.
 		//
 		// So: claim it, drive it, and then simply never tell the core the removal
-		// finished. The console survives an unplug, survives the guitar powering off,
+		// finished. The console survives an unplug, survives the controller powering off,
 		// and re-claims cleanly on replug (verified twice in one boot, handles
-		// E1EBF3C0 then E1EBF3E0, full auth and XAM registration both times).
+		// E1EBF3C0 then E1EBF3E0, full initialization and XAM registration both times).
 		//
 		// KNOWN COST: the core never completes teardown of that device object, so a
 		// handle pair is consumed per plug cycle. Bounded and slow, but real - see
-		// docs/HOW_IT_WORKS.md and docs/KNOWN_ISSUES.md. Define RIFFMASTER_REMOVE_CALL_ORIGINAL to get the
+		// docs/HOW_IT_WORKS.md and docs/KNOWN_ISSUES.md. Define XBOXINPUT_REMOVE_CALL_ORIGINAL to get the
 		// old (freezing) behaviour back for testing.
 		// ===================================================================
-#ifndef RIFFMASTER_REMOVE_CALL_ORIGINAL
-		RM_DBG("RIFFMASTER: skipping kernel removal path\r\n");
+#ifndef XBOXINPUT_REMOVE_CALL_ORIGINAL
+		XBOXINPUT_DBG("XBOXINPUT: skipping kernel removal path\r\n");
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_COMPLETE,
 			removedUser);
 		return 0;
@@ -4851,11 +4115,11 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 
 	// h->driver has been detached above for our device, so the kernel takes the same
 	// path it takes for any unclaimed device - the path that is known to survive.
-	RM_TRACE("RIFFMASTER: TRACE REMOVE PRE-ORIG h=%p\r\n", h);
+	XBOXINPUT_TRACE_LOG("XBOXINPUT: TRACE REMOVE PRE-ORIG h=%p\r\n", h);
 	NTSTATUS rr = UsbdRemoveDeviceCompleteDetour.GetOriginal<decltype(&UsbdRemoveDeviceCompleteHook)>()(h);
-	RM_TRACE("RIFFMASTER: TRACE REMOVE POST-ORIG h=%p -> 0x%08X\r\n", h, rr);
+	XBOXINPUT_TRACE_LOG("XBOXINPUT: TRACE REMOVE POST-ORIG h=%p -> 0x%08X\r\n", h, rr);
 	return rr;
-#endif // RIFFMASTER_PASSIVE_REMOVE
+#endif // XBOXINPUT_PASSIVE_REMOVE
 }
 
 static void InstallUsbProbes() {
@@ -4871,7 +4135,7 @@ static void InstallUsbProbes() {
 	struct { void* target; const void* hook; Detour* det; const char* name; } probes[] = {
 		{ (void*)UsbdAddDeviceComplete,      (void*)UsbdAddDeviceCompleteHook,      &UsbdAddDeviceCompleteDetour,      "UsbdAddDeviceComplete" },
 		{ (void*)UsbdRemoveDeviceComplete,   (void*)UsbdRemoveDeviceCompleteHook,   &UsbdRemoveDeviceCompleteDetour,   "UsbdRemoveDeviceComplete" },
-#ifdef RIFFMASTER_VERBOSE
+#ifdef XBOXINPUT_VERBOSE
 		{ (void*)UsbdGetDeviceDescriptor,    (void*)UsbdGetDeviceDescriptorHook,    &UsbdGetDeviceDescriptorDetour,    "UsbdGetDeviceDescriptor" },
 		{ (void*)UsbdGetInterfaceDescriptor, (void*)UsbdGetInterfaceDescriptorHook, &UsbdGetInterfaceDescriptorDetour, "UsbdGetInterfaceDescriptor" },
 		{ (void*)UsbdGetDeviceSpeed,         (void*)UsbdGetDeviceSpeedHook,         &UsbdGetDeviceSpeedDetour,         "UsbdGetDeviceSpeed" },
@@ -4881,12 +4145,12 @@ static void InstallUsbProbes() {
 
 	for (int i = 0; i < (sizeof(probes) / sizeof(probes[0])); i++) {
 		if (!probes[i].target) {
-			RM_DBG("RIFFMASTER: PROBE SKIP %s - null pointer\r\n", probes[i].name);
+			XBOXINPUT_DBG("XBOXINPUT: PROBE SKIP %s - null pointer\r\n", probes[i].name);
 			continue;
 		}
 		*probes[i].det = Detour(probes[i].target, probes[i].hook);
 		probes[i].det->Install();
-		RM_DBG("RIFFMASTER: PROBE installed on %s @ %p\r\n", probes[i].name, probes[i].target);
+		XBOXINPUT_DBG("XBOXINPUT: PROBE installed on %s @ %p\r\n", probes[i].name, probes[i].target);
 	}
 }
 
@@ -4923,7 +4187,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		
 		if (hid_descriptor->bDescriptorType != 0x21) {
 			DbgPrint("EINTIM: ERROR - Invalid HID descriptor type %02x!\n", hid_descriptor->bDescriptorType);
-			RM_DBG("RIFFMASTER: DROP REASON = no valid HID descriptor (0x21) after interface descriptor\r\n");
+			XBOXINPUT_DBG("XBOXINPUT: DROP REASON = no valid HID descriptor (0x21) after interface descriptor\r\n");
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
 		
@@ -4938,7 +4202,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 
 		if (index == -1) {
 			DbgPrint("EINTIM: No free index!\n");
-			RM_DBG("RIFFMASTER: DROP REASON = all 4 controller slots in use\r\n");
+			XBOXINPUT_DBG("XBOXINPUT: DROP REASON = all 4 controller slots in use\r\n");
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
 		globalIndex = index;
@@ -4989,7 +4253,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	}
 
 	DbgPrint("EINTIM: Unrelated USB Device. Calling original...\n");
-	RM_DBG("RIFFMASTER: DROP REASON = interface is not HID (class/subclass/protocol != 03/00/00). "
+	XBOXINPUT_DBG("XBOXINPUT: DROP REASON = interface is not HID (class/subclass/protocol != 03/00/00). "
 		"Saw %02X/%02X/%02X. Device DID reach the hook.\r\n",
 		interface_descriptor ? interface_descriptor->bInterfaceClass : 0xFF,
 		interface_descriptor ? interface_descriptor->bInterfaceSubClass : 0xFF,
@@ -5031,10 +4295,10 @@ static NTSTATUS GipControllerReadState(const GipControllerRef* controller,
 		return ERROR_DEVICE_NOT_CONNECTED;
 
 	GipGamepadToXInput(state, inputData);
-	if (*guidePending && g_rmCfg.guideButton) {
+	if (*guidePending && g_xboxInputConfig.guideButton) {
 		*guidePending = false;
 		DWORD now = GetTickCount();
-		if (now - *lastGuideTick >= (DWORD)g_rmCfg.guideCooldownMs) {
+		if (now - *lastGuideTick >= (DWORD)g_xboxInputConfig.guideCooldownMs) {
 			*lastGuideTick = now;
 			XamInputSendXenonButtonPress(userIndex);
 		}
@@ -5095,9 +4359,9 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		// logging every call floods xbdm and hangs the console.
 		if (g_gipCapsLogged < 3) {
 			g_gipCapsLogged++;
-			RM_DBG("RIFFMASTER: XamInputGetCapabilitiesEx(user=%d) -> GUITAR\r\n", user);
+			XBOXINPUT_DBG("XBOXINPUT: XamInputGetCapabilitiesEx(user=%d) -> GAMEPAD\r\n", user);
 		}
-		GipFillGuitarCaps(capabilities->Type, capabilities->SubType,
+		GipFillGamepadCaps(capabilities->Type, capabilities->SubType,
 			capabilities->Flags, capabilities->Gamepad);
 		capabilities->Vibration.wLeftMotorSpeed = 0;
 		capabilities->Vibration.wRightMotorSpeed = 0;
@@ -5148,8 +4412,7 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 //   0x192 = 402  XamInputSetState             <- hooked
 //   0x2AD = 685  XamInputGetCapabilitiesEx    <- hooked
 //
-// Guitar Hero works through the Ex path. Rock Band saw no device at all, which points
-// at it using the plain non-Ex capabilities call. Both capability paths are covered.
+// Different titles use different capability exports, so both paths are covered.
 //
 // This also independently cross-checks our ordinal table (docs/xam_api.md): Xenia and
 // hiddriver360 agree on 402 and 685.
@@ -5166,10 +4429,10 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 	if (GipControllerFromUser((uint8_t)user, &controller)) {
 		if (g_gipCaps2Logged < 3) {
 			g_gipCaps2Logged++;
-			RM_DBG("RIFFMASTER: XamInputGetCapabilities(user=%d flags=%d) -> GUITAR\r\n",
+			XBOXINPUT_DBG("XBOXINPUT: XamInputGetCapabilities(user=%d flags=%d) -> GAMEPAD\r\n",
 				user, flags);
 		}
-		GipFillGuitarCaps(caps->Type, caps->SubType, caps->Flags, caps->Gamepad);
+		GipFillGamepadCaps(caps->Type, caps->SubType, caps->Flags, caps->Gamepad);
 		caps->Vibration.wLeftMotorSpeed = 0;
 		caps->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
@@ -5194,15 +4457,15 @@ static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 		const DWORD now = GetTickCount();
 		if ((DWORD)(now - lastMappingReloadCheck) >= 500) {
 			lastMappingReloadCheck = now;
-			FILE* request = fopen(RM_CFG_RELOAD_PATH, "r");
+			FILE* request = fopen(XBOXINPUT_RELOAD_PATH, "r");
 			if (request) {
 				fclose(request);
 				XboxInputMappingOptions reloaded;
-				if (RmCfgLoadGamepadMapping(RM_CFG_PATH, &reloaded)) {
+				if (XboxInputLoadGamepadMapping(XBOXINPUT_CFG_PATH, &reloaded)) {
 					XboxInputPublishMapping(&reloaded);
-					RM_LOG("XBOXINPUT: mapping reloaded on request\r\n");
+					XBOXINPUT_LOG("XBOXINPUT: mapping reloaded on request\r\n");
 				}
-				remove(RM_CFG_RELOAD_PATH);
+				remove(XBOXINPUT_RELOAD_PATH);
 			}
 		}
 
@@ -5447,10 +4710,10 @@ bool initFunctionPointers() {
 	// XamGetCurrentTitleId - xam ordinal 463 (0x1CF), no arguments, returns the title ID.
 	// refs/xenia/src/xenia/kernel/xam/xam_table.inc:260, implementation at
 	// refs/xenia/src/xenia/kernel/xam/xam_info.cc:225.
-	// Optional: if it does not resolve we simply fall back to the compile-time subtype.
+	// Optional: used by the title-owned disconnect notification worker.
 	XexGetProcedureAddress(xamHandle, 463, &XamGetCurrentTitleIdPtr);
-	RM_LOG("RIFFMASTER: XamGetCurrentTitleId (463) %s\r\n",
-		XamGetCurrentTitleIdPtr ? "resolved" : "DID NOT RESOLVE - using fixed subtype");
+	XBOXINPUT_LOG("XBOXINPUT: XamGetCurrentTitleId (463) %s\r\n",
+		XamGetCurrentTitleIdPtr ? "resolved" : "DID NOT RESOLVE");
 
 	// Validate everything that the active controller path will call before any
 	// detour is installed.  The mask is persisted in the init-abort event.
@@ -5469,10 +4732,10 @@ bool initFunctionPointers() {
 	if (!XamInputSetState)              missing |= 0x00000800;
 	if (!XamInputGetCapabilitiesPtr)    missing |= 0x00001000;
 	if (!XamInputGetStatePtr)           missing |= 0x00008000;
-#ifndef RIFFMASTER_NO_NOTIFY_PATCH
+#ifndef XBOXINPUT_NO_NOTIFY_PATCH
 	if (!NotificationPatchPtr)          missing |= 0x00002000;
 #endif
-#ifndef RIFFMASTER_NO_USB_RESET
+#ifndef XBOXINPUT_NO_USB_RESET
 	if (!MmFreePhysicalMemory)           missing |= 0x00004000;
 #endif
 	g_xboxInputMissingFunctions = missing;
@@ -5524,7 +4787,7 @@ bool initFunctionPointers() {
 		//
 		// But leaving them applied permanently removes fault-containment at RUNTIME, and
 		// that is the prime suspect for the disconnect freeze (docs/usb_stack.md):
-		//   - no plugin at all: guitar power-on floods STATUS_ACCESS_VIOLATION
+		//   - no plugin at all: controller power-on floods STATUS_ACCESS_VIOLATION
 		//     (0xC0000005) FirstChance and the console KEEPS RUNNING
 		//   - killtest build (never claims, opens no endpoints): FREEZES on disconnect
 		//   - the only thing killtest shares with us that a no-plugin boot lacks is
@@ -5534,7 +4797,7 @@ bool initFunctionPointers() {
 		// reset is done (GipRestoreUsbBugchecks, called at the end of DllMain).
 		// Only needed because of the USB driver reset below. If that is skipped, these
 		// are not applied at all and kernel fault containment is never disturbed.
-#ifndef RIFFMASTER_NO_USB_RESET
+#ifndef XBOXINPUT_NO_USB_RESET
 		GipSavePatch(0, (DWORD*)0x800E05E4);
 		GipSavePatch(1, (DWORD*)0x800DD8E0);
 		*(DWORD*)0x800E05E4 = 0x48000018;
@@ -5555,7 +4818,7 @@ bool initFunctionPointers() {
 		// so 0x800D8EF0/0x800D8F00 are +0x1E8/+0x1F8, well within that range — see
 		// docs/kernel_api.md). With the USB reset skipped, UsbdDriverEntry is never
 		// re-entered, so at levels 2–5 these are inert as far as execution goes.
-#if RIFFMASTER_LEVEL >= RM_LVL_NOPS
+#if XBOXINPUT_BUILD_LEVEL >= XBOXINPUT_LEVEL_NOPS
 		*(DWORD*)0x800D8F00 = 0x60000000;
 		*(DWORD*)0x800D8EF0 = 0x60000000;
 #endif
@@ -5575,30 +4838,35 @@ bool initFunctionPointers() {
 	// USB device arrival and removal are delivered as system notifications, and the
 	// NotificationPatchPtr+48 write turns a conditional branch (0x409A bne) into an
 	// unconditional one (0x4800) inside that dispatch.
-#ifndef RIFFMASTER_NO_NOTIFY_PATCH
+#ifndef XBOXINPUT_NO_NOTIFY_PATCH
 		*(uint16_t*)0x816AB7A6 = 80; // Register custom notification type condition
 		XNotifyTimerPtr = (uint16_t*)0x816ab7aa;
 #endif
 	}
 
-#ifndef RIFFMASTER_NO_NOTIFY_PATCH
+#ifndef XBOXINPUT_NO_NOTIFY_PATCH
 	*XNotifyTimerPtr = 1500;
 #endif
 
 	// Patches notification handling to work without JRPC2, Thanks crow!
 	// 0x409A is a conditional branch (bne); 0x4800 makes it unconditional.
-#ifndef RIFFMASTER_NO_NOTIFY_PATCH
+#ifndef XBOXINPUT_NO_NOTIFY_PATCH
 	if (*(short*)((uintptr_t)(NotificationPatchPtr) + 48) == 0x409A) {
 		*(short*)((uintptr_t)(NotificationPatchPtr) + 48) = 0x4800;
 	}
 #else
-	DbgPrint("RIFFMASTER: XAM notification patches SKIPPED\r\n");
+	DbgPrint("XBOXINPUT: XAM notification patches SKIPPED\r\n");
 #endif
 
 	return true;
 }
 
 static DWORD XboxInputInitializeThread(PVOID) {
+		// Resolve and test the plugin-local configuration path before starting the
+		// logger so both files use one immutable location. This avoids a race where
+		// the logger opens HDD while configuration is still discovering USB.
+		bool cfgExisted = false;
+		bool cfgPathReady = XboxInputSelectConfigPath((PVOID)&XboxInputInitializeThread, &cfgExisted);
 #ifndef XBOXINPUT_DISABLE_FILE_LOG
 		// This function runs only after DllMain has returned. Start persistence before
 		// configuration, export resolution, patches, or hooks. Do not wait for
@@ -5618,15 +4886,15 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// Fires before ANY check below, so "did our build load at all?" is answerable
 		// even when the version/tray gate aborts the launch. Build stamp distinguishes
 		// this xex from any other hiddriver360 build on the console.
-		RM_LOG("RIFFMASTER: *** RiffMaster GIP driver loaded - built " __DATE__ " " __TIME__ " ***\r\n");
+		XBOXINPUT_LOG("XBOXINPUT: *** XboxInput GIP driver loaded - built " __DATE__ " " __TIME__ " ***\r\n");
 		BOOL trayOpen = IsTrayOpen();
-		RM_LOG("RIFFMASTER: kernel build %d, tray open = %d\r\n",
+		XBOXINPUT_LOG("XBOXINPUT: kernel build %d, tray open = %d\r\n",
 			XboxKrnlVersion->Build, trayOpen ? 1 : 0);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ENVIRONMENT,
 			((XboxKrnlVersion->Build & 0xFFFF) << 16) | (trayOpen ? 1 : 0));
 
 		if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || trayOpen) {
-			RM_LOG("RIFFMASTER: ABORTING - unsupported kernel build or disc tray open\r\n");
+			XBOXINPUT_LOG("XBOXINPUT: ABORTING - unsupported kernel build or disc tray open\r\n");
 			DbgPrint("EINTIM: Only 17559 and 17489 dashboards are currently supported or the disk tray is open. Aborting launch...\n");
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_ABORT_UNSUPPORTED,
 				((XboxKrnlVersion->Build & 0xFFFF) << 16) | (trayOpen ? 1 : 0));
@@ -5634,7 +4902,7 @@ static DWORD XboxInputInitializeThread(PVOID) {
 			return TRUE;
 		}
 
-		RM_LOG("RIFFMASTER: *** BUILD LADDER LEVEL %d ***\r\n", RIFFMASTER_LEVEL);
+		XBOXINPUT_LOG("XBOXINPUT: *** BUILD LADDER LEVEL %d ***\r\n", XBOXINPUT_BUILD_LEVEL);
 
 #ifdef XBOXINPUT_RESTORE_WGC_MATCH
 		XboxInputRestoreWgcDescriptorCheck();
@@ -5645,8 +4913,8 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// even this, the cause is DashLaunch/plugin residency itself and no amount of
 		// work inside the driver will fix it. If it survives, we have a clean floor to
 		// add subsystems onto — which is the thing the subtractive bisection lacked.
-#if RIFFMASTER_LEVEL == RM_LVL_NULL
-		RM_LOG("RIFFMASTER: level 0 - loaded and doing nothing. Disconnect the dongle now.\r\n");
+#if XBOXINPUT_BUILD_LEVEL == XBOXINPUT_LEVEL_NULL
+		XBOXINPUT_LOG("XBOXINPUT: level 0 - loaded and doing nothing. Disconnect the dongle now.\r\n");
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_COMPLETE, 0);
 		XboxInputSetDiagStage(12);
 		return TRUE;
@@ -5656,14 +4924,13 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// Read here, at load, and never again: everything downstream only reads the
 		// parsed globals, so no hot path or raised-IRQL context ever touches the disk.
 		XboxInputSetDefaultMapping(&g_xboxInputGamepadMapping);
-		bool cfgFound = RmCfgLoad(RM_CFG_PATH);
-		RM_LOG("RIFFMASTER: config %s - tilt %d, SP tilt=%d click=%d, solo=%d, "
-			"invertStrum=%d, default SubType 0x%02X, %d ini override(s)\r\n",
-			cfgFound ? "loaded from " RM_CFG_PATH : "defaults (wrote " RM_CFG_PATH ")",
-			g_rmCfg.tiltThreshold, g_rmCfg.starPowerTilt, g_rmCfg.starPowerClick,
-			g_rmCfg.soloFlag, g_rmCfg.invertStrum, g_rmCfg.defaultSubType,
-			g_rmCfg.overrideCount);
-		RM_LOG("XBOXINPUT: mapping swapSticks=%d swapTriggers=%d invert=%d/%d/%d/%d "
+		bool cfgFound = cfgPathReady && XboxInputLoadConfig(XBOXINPUT_CFG_PATH);
+		XBOXINPUT_LOG("XBOXINPUT: config %s %s - guide=%d cooldown=%dms\r\n",
+			cfgFound ? (cfgExisted ? "loaded from" : "generated at") :
+				"defaults; no writable path for",
+			XBOXINPUT_CFG_PATH,
+			g_xboxInputConfig.guideButton, g_xboxInputConfig.guideCooldownMs);
+		XBOXINPUT_LOG("XBOXINPUT: mapping swapSticks=%d swapTriggers=%d invert=%d/%d/%d/%d "
 			"stickDz=%u/%u triggerDz=%u/%u rumble=%u%%\r\n",
 			g_xboxInputGamepadMapping.swapSticks,
 			g_xboxInputGamepadMapping.swapTriggers,
@@ -5677,7 +4944,9 @@ static DWORD XboxInputInitializeThread(PVOID) {
 			g_xboxInputGamepadMapping.rightTriggerDeadzone,
 			g_xboxInputGamepadMapping.rumblePercent);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_CONFIG_LOADED,
-			(cfgFound ? 0x80000000 : 0) | (g_rmCfg.overrideCount & 0xFFFF));
+			(cfgFound ? 0x80000000 : 0));
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_CONFIG_PATH,
+			cfgFound ? (cfgExisted ? 1 : 2) : 0, 0);
 
 		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
 		if (!initFunctionPointers()) {
@@ -5689,18 +4958,18 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_FUNCTIONS_READY, 0);
 
 		DbgPrint("EINTIM: Loading mappings!\r\n");
-#ifndef RIFFMASTER_GIP_ONLY
+#ifndef XBOXINPUT_GIP_ONLY
 		if (!LoadMappingsFromFile("HDD:\\hiddriver.json")) {
 			DbgPrint("EINTIM: Failed to load mappings(JSON either doesn't exist yet or syntax error)!\r\n");
 		}
 
 #endif
-		// HID detours: NOT needed for the RiffMaster. Our claim goes through
+		// HID detours: NOT needed for the XboxInput. Our claim goes through
 		// UsbdAddDeviceComplete, not the HID driver. These patch live code at
 		// 0x800E4D68 / 0x800E4D28 - the HID device add/remove path, i.e. exactly
 		// the code that runs when a USB device disappears. Prime remaining
 		// suspect for the disconnect freeze.
-#ifndef RIFFMASTER_GIP_ONLY
+#ifndef XBOXINPUT_GIP_ONLY
 		if (isDevkit) {
 			HidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook); // 7D 88 02 A6 ? ? ? ? 94 21 ? ? 7C 7C 1B 78 ? ? ? ? 7C 7F 1B 79
 			HidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook); // 81 63 ? ? 39 40 ? ? 39 20 ? ? 99 4B
@@ -5717,22 +4986,22 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// Phase 0.5b: probe the kernel USB exports to find who handles non-HID devices.
 		// This is also where the GIP claim lives (UsbdAddDeviceComplete), so below
 		// level 7 the dongle is left unclaimed exactly as a no-plugin boot leaves it.
-#if RIFFMASTER_LEVEL >= RM_LVL_FULL
+#if XBOXINPUT_BUILD_LEVEL >= XBOXINPUT_LEVEL_FULL
 		InstallUsbProbes();
 		XboxInputSetDiagStage(10);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_USB_HOOKS_READY, 0);
 #endif
 
-#if RIFFMASTER_LEVEL >= RM_LVL_XAMHOOKS
+#if XBOXINPUT_BUILD_LEVEL >= XBOXINPUT_LEVEL_XAMHOOKS
 		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
 		XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
 		XamInputGetStateDetour = Detour(XamInputGetStatePtr, (void*)XamInputGetStateHook);
 		if (XamInputGetCapabilitiesPtr) {
 			XamInputGetCapabilitiesDetour2 = Detour(XamInputGetCapabilitiesPtr, (void*)XamInputGetCapabilitiesHook);
 			XamInputGetCapabilitiesDetour2.Install();
-			RM_LOG("RIFFMASTER: hooked XamInputGetCapabilities (400) @ %p\r\n", XamInputGetCapabilitiesPtr);
+			XBOXINPUT_LOG("XBOXINPUT: hooked XamInputGetCapabilities (400) @ %p\r\n", XamInputGetCapabilitiesPtr);
 		}
-		else RM_LOG("RIFFMASTER: ordinal 400 did NOT resolve!\r\n");
+		else XBOXINPUT_LOG("XBOXINPUT: ordinal 400 did NOT resolve!\r\n");
 		XInputdReadStateDetour = Detour(XInputdReadStatePtr, (void*)XInputdReadStateHook);
 
 		XamInputSetStateDetour.Install();
@@ -5743,25 +5012,25 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_XAM_HOOKS_READY, 0);
 		DbgPrint("EINTIM: Hooks installed\n");
 #else
-		RM_LOG("RIFFMASTER: XamInput/XInputd detours SKIPPED (level %d)\r\n", RIFFMASTER_LEVEL);
+		XBOXINPUT_LOG("XBOXINPUT: XamInput/XInputd detours SKIPPED (level %d)\r\n", XBOXINPUT_BUILD_LEVEL);
 #endif
 
 		// This is a dirty way of forcing the system to reenumerate USB devices so you don't need to replug the controllers
 		//
-		// RIFFMASTER_NO_USB_RESET skips it. This is the strongest remaining suspect for
+		// XBOXINPUT_NO_USB_RESET skips it. This is the strongest remaining suspect for
 		// the disconnect freeze: it is a full USB stack teardown and re-entry (the author
 		// calls it "dirty", and it frees a physical page out from under the driver), it is
 		// shared by the killtest build and this one, and it is absent from a no-plugin
 		// boot - which is the exact configuration that survives a disconnect.
 		//
 		// We do not need it. Its only benefit is that devices already plugged in when the
-		// plugin loads get re-enumerated; the guitar is powered on after boot anyway, so
+		// plugin loads get re-enumerated; the controller is powered on after boot anyway, so
 		// our UsbdAddDeviceComplete detour sees it arrive normally.
 		//
 		// Skipping it also makes the bugcheck patches unnecessary, since those exist
 		// solely to let this sequence run - which is why the earlier "skip the patches but
 		// still do the reset" build hung at boot.
-#ifndef RIFFMASTER_NO_USB_RESET
+#ifndef XBOXINPUT_NO_USB_RESET
 		DbgPrint("EINTIM: Resetting USB driver!\n");
 		UsbdPowerDownNotification();
 
@@ -5774,16 +5043,16 @@ static DWORD XboxInputInitializeThread(PVOID) {
 
 		// The USB driver reset is done, so the bugchecks are no longer in the way.
 		// Put them back: with fault containment restored, a USB fault at runtime
-		// (e.g. the guitar going to sleep) should raise a survivable exception the way
+		// (e.g. the controller going to sleep) should raise a survivable exception the way
 		// it does with no plugin loaded, instead of hanging the console.
 		// OFF by default. Restoring the bugchecks did NOT fix the disconnect freeze, and
-		// it coincided with Rock Band and Guitar Hero failing to launch at all - so it
-		// is a suspected regression, not a neutral change. Only enable to re-test.
-#ifdef RIFFMASTER_RESTORE_BUGCHECKS
+		// it coincided with titles failing to launch - so it is a suspected regression,
+		// not a neutral change. Only enable to re-test.
+#ifdef XBOXINPUT_RESTORE_BUGCHECKS
 		GipRestoreUsbBugchecks();
 #endif
 #else
-		RM_LOG("RIFFMASTER: USB driver reset SKIPPED - power the guitar on AFTER boot\r\n");
+		XBOXINPUT_LOG("XBOXINPUT: USB driver reset SKIPPED - power the controller on AFTER boot\r\n");
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_USB_RESET_SKIPPED, 0);
 #endif
 
@@ -5791,13 +5060,13 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_COMPLETE, 0);
 
 		// Start mapping manager thread.
-		// Not needed for the RiffMaster: our mapping is fixed and known, so the JSON
+		// Not needed for the XboxInput: our mapping is fixed and known, so the JSON
 		// mapping system and its background thread are dead weight (and the project's
 		// release criteria say the plugin must need no config file).
-#ifndef RIFFMASTER_GIP_ONLY
+#ifndef XBOXINPUT_GIP_ONLY
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
 #endif
-#endif // RIFFMASTER_LEVEL == RM_LVL_NULL
+#endif // XBOXINPUT_BUILD_LEVEL == XBOXINPUT_LEVEL_NULL
 	return 0;
 }
 
