@@ -163,6 +163,17 @@ enum XboxInputUsbStep {
 	XBOXINPUT_USB_EARLY_POWER_COMPLETE,
 	XBOXINPUT_USB_RESUMED_FROM_INPUT,
 	XBOXINPUT_USB_READ_LOOP_STOPPED,
+	XBOXINPUT_USB_PRE_READ_LED_QUEUED,
+	XBOXINPUT_USB_PRE_READ_LED_COMPLETE,
+	XBOXINPUT_USB_PRE_READ_AUTH_QUEUED,
+	XBOXINPUT_USB_PRE_READ_AUTH_COMPLETE,
+	XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_QUEUED,
+	XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_COMPLETE,
+	XBOXINPUT_USB_INIT_POWER_QUEUED,
+	XBOXINPUT_USB_INIT_POWER_COMPLETE,
+	XBOXINPUT_USB_INIT_RUMBLE_SETUP_QUEUED,
+	XBOXINPUT_USB_INIT_RUMBLE_SETUP_COMPLETE,
+	XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE,
 	XBOXINPUT_USB_POWERA_STAGE = 100,
 };
 struct XboxInputLogEvent {
@@ -325,6 +336,17 @@ static const char* XboxInputUsbStepName(DWORD step) {
 	case XBOXINPUT_USB_EARLY_POWER_COMPLETE: return "early_power_complete";
 	case XBOXINPUT_USB_RESUMED_FROM_INPUT: return "resumed_from_valid_input";
 	case XBOXINPUT_USB_READ_LOOP_STOPPED: return "read_loop_stopped";
+	case XBOXINPUT_USB_PRE_READ_LED_QUEUED: return "pre_read_led_queued";
+	case XBOXINPUT_USB_PRE_READ_LED_COMPLETE: return "pre_read_led_complete";
+	case XBOXINPUT_USB_PRE_READ_AUTH_QUEUED: return "pre_read_auth_queued";
+	case XBOXINPUT_USB_PRE_READ_AUTH_COMPLETE: return "pre_read_auth_complete";
+	case XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_QUEUED: return "audio_interface_disable_queued";
+	case XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_COMPLETE: return "audio_interface_disable_complete";
+	case XBOXINPUT_USB_INIT_POWER_QUEUED: return "init_power_queued";
+	case XBOXINPUT_USB_INIT_POWER_COMPLETE: return "init_power_complete";
+	case XBOXINPUT_USB_INIT_RUMBLE_SETUP_QUEUED: return "init_rumble_setup_queued";
+	case XBOXINPUT_USB_INIT_RUMBLE_SETUP_COMPLETE: return "init_rumble_setup_complete";
+	case XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE: return "post_identify_startup_complete";
 	default: return step >= XBOXINPUT_USB_POWERA_STAGE ? "powera_init_stage" : "unknown";
 	}
 }
@@ -2326,6 +2348,12 @@ struct GipSessionSlot {
 	volatile LONG           powerAInitStage;
 	volatile LONG           powerAIdentifyComplete;
 	BYTE                    powerAInitBuf[64];
+	volatile LONG           preReadInitStage;
+	BYTE                    preReadInitBuf[16];
+	volatile LONG           readBeforeInitPending;
+	bool                    deferredReadValid;
+	DWORD                   deferredReadLength;
+	BYTE                    deferredReadBuf[GIP_READ_BUF_SIZE];
 };
 static GipSessionSlot g_gipSessions[GIP_MAX_SESSIONS];
 static GipSessionSlot* g_gipPrimarySession = &g_gipSessions[0];
@@ -2712,6 +2740,7 @@ static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE ri
 }
 
 static void GipRegisterWithXam();
+static int GipStartPostIdentifyStartup(GipSessionSlot* session);
 static void GipFillGamepadCaps(BYTE& type, BYTE& subType, WORD& flags, XINPUT_GAMEPAD& pad);
 static void GipUnregisterFromXam();
 
@@ -3036,6 +3065,21 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 					break;
 				}
 
+				const XboxInputControllerProfile* profile = g_gipRuntime.profile;
+				if (profile &&
+					(profile->quirks & XBOXINPUT_QUIRK_LED_AUTH_BEFORE_INPUT) != 0) {
+					if ((profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) != 0) {
+						GipStartPostIdentifyStartup(g_gipPrimarySession);
+						break;
+					}
+					if (!XboxInputRuntimeIsReady(&g_gipRuntime)) {
+						XboxInputRuntimeSetReady(&g_gipRuntime, true);
+						g_gipClaimAttempts = 0;
+						GipRegisterWithXam();
+					}
+					break;
+				}
+
 				// Replay what the Windows host sent, in order, from the captured
 				// enumeration (docs/GIP protocol notes section 5 stage 2). Previously we
 				// sent only POWER ON and the device went quiet then disconnected.
@@ -3176,6 +3220,13 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 			if (hdr.options & GIP_OPT_ACKNOWLEDGE)
 				GipSessionSendAck(session, &hdr);
 			if (hdr.packetLength == 0 && !session->poweredOn) {
+				const XboxInputControllerProfile* profile = session->runtime.profile;
+				if (profile &&
+					(profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) != 0) {
+					session->poweredOn = true;
+					GipStartPostIdentifyStartup(session);
+					break;
+				}
 				static const BYTE locale[15] = { 6,0,0,0,0,0,0,'U','S',0,0,0,0,0,0 };
 				static const BYTE led[3] = { 0,1,0x14 };
 				BYTE mode = 0;
@@ -3220,6 +3271,17 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 static int  g_gipReadErrors = 0;
 static bool g_gipReadLoopStopped = false;
 
+enum GipPreReadInitStage {
+	GIP_PRE_READ_INIT_IDLE = 0,
+	GIP_PRE_READ_INIT_POWER,
+	GIP_PRE_READ_INIT_LED,
+	GIP_PRE_READ_INIT_AUTH_DONE,
+	GIP_PRE_READ_INIT_RUMBLE_SETUP,
+	GIP_PRE_READ_INIT_COMPLETE,
+};
+
+static void GipResumeAfterPreReadInit(GipSessionSlot* session);
+
 int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 4);
 
@@ -3229,6 +3291,11 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	if (!ext || !ext->deviceHandle ||
 		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return 0;
+	const XboxInputControllerProfile* completionProfile = g_gipRuntime.profile;
+	const bool readBeforeInit = completionProfile &&
+		(completionProfile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0;
+	if (readBeforeInit)
+		InterlockedExchange(&g_gipPrimarySession->readBeforeInitPending, 2);
 
 	// -----------------------------------------------------------------------
 	// THE DISCONNECT FREEZE LIVED HERE. Do not remove this guard.
@@ -3267,6 +3334,28 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	// So bound UNPRODUCTIVE completions, whatever their status, and reset only on a
 	// completion that actually delivered a packet.
 	bool productive = (status == 0 && g_gipReadBuf[0] != 0);
+	if (readBeforeInit &&
+		InterlockedCompareExchange(&g_gipPrimarySession->preReadInitStage, 0, 0) !=
+		GIP_PRE_READ_INIT_COMPLETE) {
+		g_gipReadErrors = 0;
+		if (productive) {
+			DWORD length = ext->interruptTrb.length;
+			if (length > sizeof(g_gipPrimarySession->deferredReadBuf))
+				length = sizeof(g_gipPrimarySession->deferredReadBuf);
+			memcpy(g_gipPrimarySession->deferredReadBuf, g_gipReadBuf, length);
+			g_gipPrimarySession->deferredReadLength = length;
+			__sync();
+			g_gipPrimarySession->deferredReadValid = true;
+		}
+		__sync();
+		InterlockedExchange(&g_gipPrimarySession->readBeforeInitPending, 0);
+		if (InterlockedCompareExchange(&g_gipPrimarySession->preReadInitStage, 0, 0) ==
+			GIP_PRE_READ_INIT_COMPLETE &&
+			InterlockedCompareExchange(
+				&g_gipPrimarySession->readBeforeInitPending, 3, 0) == 0)
+			GipResumeAfterPreReadInit(g_gipPrimarySession);
+		return status;
+	}
 	if (productive) {
 		g_gipReadErrors = 0;
 		GipHandleTransfer(g_gipReadBuf, (int)ext->interruptTrb.length);
@@ -3311,6 +3400,8 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 
 	// A failed re-arm is the same hazard by another route: if the queue itself starts
 	// rejecting, the caller may keep driving us. Stop on the same budget.
+	if (readBeforeInit)
+		InterlockedExchange(&g_gipPrimarySession->readBeforeInitPending, 1);
 	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
 	if (queued != 0 && ++g_gipReadErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
 		ext->deviceHandle = 0;
@@ -3335,10 +3426,175 @@ static int32_t GipStartPrimaryRead(HidControllerExtension* ext, uint16_t packetS
 	ext->interruptTrb.buffer = g_gipReadBuf;
 	ext->interruptTrb.callback = (DWORD)GipInterruptComplete;
 	ext->interruptTrb.flags = 1;
+	if (g_gipRuntime.profile &&
+		(g_gipRuntime.profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0)
+		InterlockedExchange(&g_gipPrimarySession->readBeforeInitPending, 1);
 	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, queued);
 	return queued;
 #endif
+}
+
+static int GipQueuePreReadInit(GipSessionSlot* session, LONG stage);
+static int32_t GipPreReadInitComplete(DWORD trbAddr, int32_t status);
+static int32_t GipSessionStartRead(GipSessionSlot* session);
+static int32_t GipSessionEarlyPowerComplete(DWORD trbAddr, int32_t status);
+
+static int GipStartPostIdentifyStartup(GipSessionSlot* session) {
+	if (!session || !session->runtime.profile ||
+		(session->runtime.profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) == 0)
+		return -1;
+	return GipQueuePreReadInit(session, GIP_PRE_READ_INIT_POWER);
+}
+
+static void GipResumeAfterPreReadInit(GipSessionSlot* session) {
+	if (!session || !session->reserved) {
+		if (session)
+			InterlockedExchange(&session->readBeforeInitPending, 0);
+		return;
+	}
+	if (session->deferredReadValid) {
+		session->deferredReadValid = false;
+		__sync();
+		if (session->primary)
+			GipHandleTransfer(session->deferredReadBuf,
+				(int)session->deferredReadLength);
+		else
+			GipSessionHandleTransfer(session, session->deferredReadBuf,
+				(int)session->deferredReadLength);
+	}
+	if (!session->ext.deviceHandle || !session->runtime.profile) {
+		InterlockedExchange(&session->readBeforeInitPending, 0);
+		return;
+	}
+	if (session->primary)
+		GipStartPrimaryRead(&session->ext,
+			session->runtime.profile->endpointIdentity.maximumPacketSize);
+	else
+		GipSessionStartRead(session);
+}
+
+static int GipQueuePreReadInit(GipSessionSlot* session, LONG stage) {
+	if (!session || !session->reserved || !session->outOpen ||
+		!session->ext.deviceHandle || !session->runtime.profile)
+		return -1;
+
+	BYTE command = 0;
+	BYTE options = GIP_OPT_INTERNAL;
+	const BYTE* payload = 0;
+	int payloadLength = 0;
+	DWORD queuedStep = 0;
+	static const BYTE powerOn[1] = { 0x00 };
+	static const BYTE ledOn[3] = { 0x00, 0x01, 0x14 };
+	static const BYTE authDone[2] = { 0x01, 0x00 };
+	static const BYTE rumbleSetup[9] = {
+		0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEB
+	};
+	if (stage == GIP_PRE_READ_INIT_POWER) {
+		command = GIP_CMD_POWER;
+		payload = powerOn;
+		payloadLength = sizeof(powerOn);
+		queuedStep = XBOXINPUT_USB_INIT_POWER_QUEUED;
+	}
+	else if (stage == GIP_PRE_READ_INIT_LED) {
+		command = GIP_CMD_LED;
+		payload = ledOn;
+		payloadLength = sizeof(ledOn);
+		queuedStep = XBOXINPUT_USB_PRE_READ_LED_QUEUED;
+	}
+	else if (stage == GIP_PRE_READ_INIT_AUTH_DONE) {
+		command = GIP_CMD_AUTHENTICATE;
+		payload = authDone;
+		payloadLength = sizeof(authDone);
+		queuedStep = XBOXINPUT_USB_PRE_READ_AUTH_QUEUED;
+	}
+	else if (stage == GIP_PRE_READ_INIT_RUMBLE_SETUP) {
+		command = GIP_CMD_RUMBLE;
+		options = 0;
+		payload = rumbleSetup;
+		payloadLength = sizeof(rumbleSetup);
+		queuedStep = XBOXINPUT_USB_INIT_RUMBLE_SETUP_QUEUED;
+	}
+	else {
+		return -1;
+	}
+
+	int length = 0;
+	session->preReadInitBuf[length++] = command;
+	session->preReadInitBuf[length++] = options;
+	session->preReadInitBuf[length++] = GipSessionNextSeq(session);
+	session->preReadInitBuf[length++] = (BYTE)payloadLength;
+	memcpy(session->preReadInitBuf + length, payload, payloadLength);
+	length += payloadLength;
+	InterlockedExchange(&session->preReadInitStage, stage);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, queuedStep, command);
+	SendInterruptRequest(session->ext.deviceHandle, &session->outTrb,
+		session->preReadInitBuf, length, (DWORD)GipPreReadInitComplete);
+	return 0;
+}
+
+static int32_t GipPreReadInitComplete(DWORD trbAddr, int32_t status) {
+	GipSessionSlot* session = 0;
+	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
+		if ((DWORD)&g_gipSessions[i].outTrb == trbAddr) {
+			session = &g_gipSessions[i];
+			break;
+		}
+	}
+	if (!session || !session->reserved || !session->ext.deviceHandle)
+		return status;
+
+	LONG completed = InterlockedCompareExchange(&session->preReadInitStage, 0, 0);
+	DWORD completeStep = XBOXINPUT_USB_PRE_READ_AUTH_COMPLETE;
+	if (completed == GIP_PRE_READ_INIT_POWER)
+		completeStep = XBOXINPUT_USB_INIT_POWER_COMPLETE;
+	else if (completed == GIP_PRE_READ_INIT_LED)
+		completeStep = XBOXINPUT_USB_PRE_READ_LED_COMPLETE;
+	else if (completed == GIP_PRE_READ_INIT_RUMBLE_SETUP)
+		completeStep = XBOXINPUT_USB_INIT_RUMBLE_SETUP_COMPLETE;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, completeStep, status);
+	if (status != 0) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 80 + completed, status);
+		return status;
+	}
+	if (completed == GIP_PRE_READ_INIT_POWER)
+		return GipQueuePreReadInit(session, GIP_PRE_READ_INIT_LED);
+	if (completed == GIP_PRE_READ_INIT_LED)
+		return GipQueuePreReadInit(session, GIP_PRE_READ_INIT_AUTH_DONE);
+	const XboxInputControllerProfile* profile = session->runtime.profile;
+	if (completed == GIP_PRE_READ_INIT_AUTH_DONE && profile &&
+		(profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) != 0)
+		return GipQueuePreReadInit(session, GIP_PRE_READ_INIT_RUMBLE_SETUP);
+	if (completed != GIP_PRE_READ_INIT_AUTH_DONE &&
+		completed != GIP_PRE_READ_INIT_RUMBLE_SETUP)
+		return status;
+
+	InterlockedExchange(&session->preReadInitStage, GIP_PRE_READ_INIT_COMPLETE);
+	if (profile && session->identifyReplySeen && session->poweredOn &&
+		(profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) != 0) {
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE, status);
+		if (!XboxInputRuntimeIsReady(&session->runtime)) {
+			if (session->primary) {
+				XboxInputRuntimeSetReady(&session->runtime, true);
+				g_gipClaimAttempts = 0;
+				GipRegisterWithXam();
+			}
+			else {
+				GipSessionRegisterWithXam(session);
+			}
+		}
+	}
+	if (profile &&
+		(profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0) {
+		if (InterlockedCompareExchange(&session->readBeforeInitPending, 3, 0) == 0)
+			GipResumeAfterPreReadInit(session);
+		return status;
+	}
+	if (session->primary)
+		return GipStartPrimaryRead(&session->ext,
+			profile->endpointIdentity.maximumPacketSize);
+	return GipSessionStartRead(session);
 }
 
 static int32_t GipEarlyPowerComplete(DWORD trbAddr, int32_t status) {
@@ -3351,8 +3607,61 @@ static int32_t GipEarlyPowerComplete(DWORD trbAddr, int32_t status) {
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_EARLY_POWER_COMPLETE, status);
 	// A disconnect may have occurred while this asynchronous transfer was in
 	// flight. Never start a read on a new claim from an old completion.
-	if (poweredHandle && g_gipExt.deviceHandle == poweredHandle)
+	if (poweredHandle && g_gipExt.deviceHandle == poweredHandle) {
+		const XboxInputControllerProfile* profile = g_gipRuntime.profile;
+		if (status == 0 && profile &&
+			(profile->quirks & XBOXINPUT_QUIRK_LED_AUTH_BEFORE_INPUT) != 0)
+			return GipQueuePreReadInit(g_gipPrimarySession, GIP_PRE_READ_INIT_LED);
+		if (profile &&
+			(profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0)
+			return status;
 		return GipStartPrimaryRead(&g_gipExt, packetSize);
+	}
+	return status;
+}
+
+static int32_t GipDisableAudioInterfaceComplete(DWORD trbAddr, int32_t status) {
+	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 36);
+	GipSessionSlot* session = GipSessionFromExtension(ext);
+	if (!session || !session->reserved || !ext || !ext->deviceHandle)
+		return status;
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+		XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_COMPLETE, status);
+	if (status != 0)
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_FAILURE, 90, status);
+
+	const XboxInputControllerProfile* profile = session->runtime.profile;
+	if (!profile ||
+		(profile->quirks & XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE) == 0)
+		return status;
+
+	if (session->primary) {
+		if (!session->outOpen ||
+			InterlockedCompareExchange(&session->earlyPowerBusy, 1, 0) != 0)
+			return status;
+		session->earlyPowerHandle = ext->deviceHandle;
+		session->earlyPowerPacketSize = profile->endpointIdentity.maximumPacketSize;
+		session->outTrb.buffer = session->earlyPowerBuf;
+		session->outTrb.length = sizeof(session->earlyPowerBuf);
+		session->outTrb.flags = 1;
+		session->outTrb.callback = (DWORD)GipEarlyPowerComplete;
+		session->outTrb.savedEndpoint = session->outTrb.endpoint;
+		int32_t token = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_EARLY_POWER_QUEUED, token);
+		return status;
+	}
+
+	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
+	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
+	session->outTrb.buffer = session->earlyPowerBuf;
+	session->outTrb.length = sizeof(session->earlyPowerBuf);
+	session->outTrb.flags = 1;
+	session->outTrb.callback = (DWORD)GipSessionEarlyPowerComplete;
+	session->outTrb.savedEndpoint = session->outTrb.endpoint;
+	int32_t token = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+		XBOXINPUT_USB_EARLY_POWER_QUEUED, token);
 	return status;
 }
 
@@ -3435,6 +3744,21 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	XBOXINPUT_LOG("XBOXINPUT: interrupt reads NOT started (noread variant)\r\n");
 	return 0;
 #endif
+	const bool readBeforeInit =
+		(activeProfile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0;
+	if (readBeforeInit) {
+		InterlockedExchange(&g_gipPrimarySession->preReadInitStage,
+			GIP_PRE_READ_INIT_POWER);
+		GipStartPrimaryRead(ext, pkt);
+	}
+	if ((activeProfile->quirks & XBOXINPUT_QUIRK_DISABLE_AUDIO_INTERFACE) != 0) {
+		int32_t token = SendControlRequest(ext->deviceHandle, &ext->controlTrb,
+			0x01, 0x0B, 0, 1, 0, 0,
+			(DWORD)GipDisableAudioInterfaceComplete);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_QUEUED, token);
+		return 0;
+	}
 	if (g_gipOutOpen &&
 		(activeProfile->quirks & XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE) != 0 &&
 		InterlockedCompareExchange(&g_gipEarlyPowerBusy, 1, 0) == 0) {
@@ -3453,7 +3777,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 			XBOXINPUT_USB_EARLY_POWER_QUEUED, queueToken);
 		return 0;
 	}
-	return GipStartPrimaryRead(ext, pkt);
+	return readBeforeInit ? 0 : GipStartPrimaryRead(ext, pkt);
 }
 
 // Additional controllers use the same session-owned storage model with a compact
@@ -3464,7 +3788,34 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	GipSessionSlot* session = GipSessionFromExtension(ext);
 	if (!session || !session->reserved || !ext || !ext->deviceHandle)
 		return 0;
-	if (status == 0 && session->readBuf[0] != 0) {
+	const XboxInputControllerProfile* completionProfile = session->runtime.profile;
+	const bool readBeforeInit = completionProfile &&
+		(completionProfile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0;
+	if (readBeforeInit)
+		InterlockedExchange(&session->readBeforeInitPending, 2);
+	const bool productive = status == 0 && session->readBuf[0] != 0;
+	if (readBeforeInit &&
+		InterlockedCompareExchange(&session->preReadInitStage, 0, 0) !=
+		GIP_PRE_READ_INIT_COMPLETE) {
+		session->readErrors = 0;
+		if (productive) {
+			DWORD length = ext->interruptTrb.length;
+			if (length > sizeof(session->deferredReadBuf))
+				length = sizeof(session->deferredReadBuf);
+			memcpy(session->deferredReadBuf, session->readBuf, length);
+			session->deferredReadLength = length;
+			__sync();
+			session->deferredReadValid = true;
+		}
+		__sync();
+		InterlockedExchange(&session->readBeforeInitPending, 0);
+		if (InterlockedCompareExchange(&session->preReadInitStage, 0, 0) ==
+			GIP_PRE_READ_INIT_COMPLETE &&
+			InterlockedCompareExchange(&session->readBeforeInitPending, 3, 0) == 0)
+			GipResumeAfterPreReadInit(session);
+		return status;
+	}
+	if (productive) {
 		session->readErrors = 0;
 		GipSessionHandleTransfer(session, session->readBuf, (int)ext->interruptTrb.length);
 	}
@@ -3482,6 +3833,8 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	ext->interruptTrb.length = GIP_READ_BUF_SIZE;
 	ext->interruptTrb.buffer = session->readBuf;
 	ext->interruptTrb.callback = (DWORD)GipSessionInterruptComplete;
+	if (readBeforeInit)
+		InterlockedExchange(&session->readBeforeInitPending, 1);
 	return UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
 }
 
@@ -3495,6 +3848,9 @@ static int32_t GipSessionStartRead(GipSessionSlot* session) {
 	ext->interruptTrb.buffer = session->readBuf;
 	ext->interruptTrb.callback = (DWORD)GipSessionInterruptComplete;
 	ext->interruptTrb.flags = 1;
+	if (session->runtime.profile &&
+		(session->runtime.profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0)
+		InterlockedExchange(&session->readBeforeInitPending, 1);
 	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_READ_QUEUED, queued);
 	return queued;
@@ -3507,8 +3863,16 @@ static int32_t GipSessionEarlyPowerComplete(DWORD trbAddr, int32_t status) {
 			continue;
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 			XBOXINPUT_USB_EARLY_POWER_COMPLETE, status);
-		return session->reserved && session->ext.deviceHandle
-			? GipSessionStartRead(session) : status;
+		if (!session->reserved || !session->ext.deviceHandle)
+			return status;
+		const XboxInputControllerProfile* profile = session->runtime.profile;
+		if (status == 0 && profile &&
+			(profile->quirks & XBOXINPUT_QUIRK_LED_AUTH_BEFORE_INPUT) != 0)
+			return GipQueuePreReadInit(session, GIP_PRE_READ_INIT_LED);
+		if (profile &&
+			(profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0)
+			return status;
+		return GipSessionStartRead(session);
 	}
 	return status;
 }
@@ -3533,8 +3897,23 @@ static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
 	session->outOpen = !NT_ERROR(outStatus);
 	if (!session->outOpen)
 		return outStatus;
+	const bool readBeforeInit =
+		(profile->quirks & XBOXINPUT_QUIRK_READ_BEFORE_INIT) != 0;
+	if (readBeforeInit) {
+		InterlockedExchange(&session->preReadInitStage,
+			GIP_PRE_READ_INIT_POWER);
+		GipSessionStartRead(session);
+	}
+	if ((profile->quirks & XBOXINPUT_QUIRK_DISABLE_AUDIO_INTERFACE) != 0) {
+		int32_t token = SendControlRequest(ext->deviceHandle, &ext->controlTrb,
+			0x01, 0x0B, 0, 1, 0, 0,
+			(DWORD)GipDisableAudioInterfaceComplete);
+		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
+			XBOXINPUT_USB_AUDIO_INTERFACE_DISABLE_QUEUED, token);
+		return 0;
+	}
 	if ((profile->quirks & XBOXINPUT_QUIRK_POWER_BEFORE_ANNOUNCE) == 0)
-		return GipSessionStartRead(session);
+		return readBeforeInit ? 0 : GipSessionStartRead(session);
 	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
 	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
 	session->outTrb.buffer = session->earlyPowerBuf;
@@ -3545,7 +3924,7 @@ static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
 	int32_t queueToken = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 		XBOXINPUT_USB_EARLY_POWER_QUEUED, queueToken);
-	return 0; // The completion callback starts the read, as on the primary path.
+	return 0; // The callback starts the read unless the profile armed it first.
 }
 
 static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
@@ -3667,7 +4046,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 		(DWORD)status);
 
 	if (status != 0 && h && g_gipExt.deviceHandle && detectedProfile &&
-		detectedVid == MICROSOFT_VENDOR_ID &&
+		detectedProfile->initProfile == XBOXINPUT_INIT_GIP_STANDARD &&
 		GipActiveSessionCount() < GIP_MAX_ADDITIONAL_ACTIVE && GipFindFreeSession()) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_CONTROLLER_DETECTED,
 			((DWORD)detectedVid << 16) | detectedPid,
