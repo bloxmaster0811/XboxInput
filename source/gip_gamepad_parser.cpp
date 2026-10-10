@@ -72,7 +72,10 @@ void XboxInputBuildGipRumblePayload(uint8_t leftMotor, uint8_t rightMotor,
 	if (!payload)
 		return;
 	payload[0] = 0x00; // reserved
-	payload[1] = 0x03; // left and right grip motors
+	// Keep all four actuator bits enabled even though the 360 API only supplies
+	// values for the two main motors. This is the canonical wired-GIP packet used
+	// by both xone and SDL and is required by some third-party firmware.
+	payload[1] = 0x0F;
 	payload[2] = 0x00; // left trigger motor (no Xbox 360 equivalent)
 	payload[3] = 0x00; // right trigger motor
 	payload[4] = leftMotor;

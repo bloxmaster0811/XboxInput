@@ -14,7 +14,7 @@ static void TestButtons() {
 		uint8_t payload[14] = {0};
 		payload[0] = cases[i].low;
 		payload[1] = cases[i].high;
-		XboxInputGipGamepadState state = {0};
+		XboxInputGipGamepadState state = {};
 		assert(XboxInputParseGipGamepadPayload(payload, sizeof(payload), &state));
 		assert(state.buttons == cases[i].expected);
 	}
@@ -25,7 +25,7 @@ static void TestAnalogsAndValidation() {
 		0, 0, 0xFF, 0x03, 0x00, 0x02,
 		0x00, 0x80, 0xFF, 0x7F, 0xFF, 0xFF, 0x34, 0x12
 	};
-	XboxInputGipGamepadState state = {0};
+	XboxInputGipGamepadState state = {};
 	assert(XboxInputParseGipGamepadPayload(payload, sizeof(payload), &state));
 	assert(state.leftTrigger == 255 && state.rightTrigger == 128);
 	assert(state.leftX == -32768 && state.leftY == 32767);
@@ -62,7 +62,7 @@ static void TestRumblePayload() {
 	uint8_t payload[9] = {0};
 	XboxInputBuildGipRumblePayload(0x12, 0x34, payload);
 	const uint8_t expected[9] = {
-		0x00, 0x03, 0x00, 0x00, 0x12, 0x34, 0xFF, 0x00, 0xEB
+		0x00, 0x0F, 0x00, 0x00, 0x12, 0x34, 0xFF, 0x00, 0xEB
 	};
 	assert(memcmp(payload, expected, sizeof(expected)) == 0);
 
@@ -77,7 +77,7 @@ static void TestMappings() {
 	XboxInputGipGamepadState input = {
 		(uint16_t)(0x1000 | 0x0001), 100, 200, -32768, 500, 2000, -3000
 	};
-	XboxInputGipGamepadState output = {0};
+	XboxInputGipGamepadState output = {};
 	XboxInputApplyGamepadMapping(&input, &mapping, &output);
 	assert(memcmp(&input, &output, sizeof(input)) == 0);
 
@@ -95,8 +95,9 @@ static void TestMappings() {
 	assert(output.leftTrigger == 195 && output.rightTrigger == 100);
 	assert(!XboxInputSetButtonMappingByName(&mapping, "NotAButton", "A"));
 	assert(!XboxInputSetButtonMappingByName(&mapping, "A", "NotAButton"));
-	assert(XboxInputScaleRumble(255, 100) == 255);
-	assert(XboxInputScaleRumble(255, 50) == 128);
+	assert(XboxInputScaleRumble(255, 100) == 100);
+	assert(XboxInputScaleRumble(255, 50) == 50);
+	assert(XboxInputScaleRumble(128, 100) == 50);
 	assert(XboxInputScaleRumble(123, 0) == 0);
 }
 

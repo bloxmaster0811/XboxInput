@@ -140,5 +140,9 @@ void XboxInputApplyGamepadMapping(const XboxInputGipGamepadState* input,
 
 uint8_t XboxInputScaleRumble(uint8_t motor, uint8_t percent) {
 	if (percent > 100) percent = 100;
-	return (uint8_t)(((uint32_t)motor * percent + 50u) / 100u);
+	// XInput exposes a 0..255 value after the 16-bit motor speed is reduced,
+	// but established GIP drivers encode motor magnitude as a percentage.
+	// Scale both the configured strength and the protocol range in one step so
+	// a full-strength request never exceeds the GIP 0..100 range.
+	return (uint8_t)(((uint32_t)motor * percent + 127u) / 255u);
 }

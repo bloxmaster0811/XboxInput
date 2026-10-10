@@ -86,8 +86,8 @@ if ($guidePending) { $failures += 'guide: repeated DOWN produced a duplicate edg
 if (-not $guidePending) { $failures += 'guide: DOWN after UP did not produce a new edge' }
 if (Apply-Guide ([byte[]](1, 0x5A))) { $failures += 'guide: accepted an unrelated virtual key' }
 
-[byte[]]$rumble = 0x00, 0x03, 0x00, 0x00, 0x12, 0x34, 0xFF, 0x00, 0xEB
-$expectedRumbleHex = '000300001234ff00eb'
+[byte[]]$rumble = 0x00, 0x0F, 0x00, 0x00, 0x12, 0x34, 0xFF, 0x00, 0xEB
+$expectedRumbleHex = '000f00001234ff00eb'
 $actualRumbleHex = -join ($rumble | ForEach-Object { $_.ToString('x2') })
 if ($actualRumbleHex -ne $expectedRumbleHex) {
     $failures += "rumble: expected $expectedRumbleHex, got $actualRumbleHex"
@@ -115,8 +115,11 @@ if ($invertedMinimum -ne 32767) { $failures += 'mapping: signed minimum inversio
 $scaledTrigger = [math]::Floor(((200 - 20) * 255 +
     [math]::Floor((255 - 20) / 2)) / (255 - 20))
 if ($scaledTrigger -ne 195) { $failures += 'mapping: trigger deadzone scaling failed' }
-$halfRumble = [math]::Floor((255 * 50 + 50) / 100)
-if ($halfRumble -ne 128) { $failures += 'mapping: rumble scaling failed' }
+$fullRumble = [math]::Floor((255 * 100 + 127) / 255)
+$halfRumble = [math]::Floor((255 * 50 + 127) / 255)
+if ($fullRumble -ne 100 -or $halfRumble -ne 50) {
+    $failures += 'mapping: GIP rumble scaling failed'
+}
 
 if ($failures.Count) {
     $failures | ForEach-Object { Write-Error $_ }

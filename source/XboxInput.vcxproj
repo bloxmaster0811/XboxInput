@@ -94,7 +94,13 @@
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="gip_protocol.h" />
+    <ClInclude Include="gip_output_queue.h" />
+    <ClInclude Include="gip_output_trace.h" />
+    <ClInclude Include="gip_output_policy.h" />
+    <ClInclude Include="gip_input_readiness.h" />
+    <ClInclude Include="gip_output_transport.inl" />
     <ClInclude Include="xboxinput_config.h" />
+    <ClInclude Include="title_worker_policy.h" />
     <ClInclude Include="controller_backend.h" />
     <ClInclude Include="gip_gamepad_parser.h" />
     <ClInclude Include="gamepad_mapping.h" />

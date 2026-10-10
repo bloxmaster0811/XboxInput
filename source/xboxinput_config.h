@@ -10,7 +10,11 @@
 #define XBOXINPUT_CFG_FILENAME        "XboxInput.ini"
 #define XBOXINPUT_RELOAD_FILENAME     "XboxInput.reload"
 #define XBOXINPUT_LOG_FILENAME        "XboxInputGip.log"
+#define XBOXINPUT_PREVIOUS_LOG_FILENAME "XboxInputGip.prev.log"
+#define XBOXINPUT_LOG_ROTATE_FILENAME "XboxInputGip.rotate.log"
 #define XBOXINPUT_PROBE_FILENAME      "XboxInputCompatProbe.log"
+#define XBOXINPUT_PREVIOUS_PROBE_FILENAME "XboxInputCompatProbe.prev.log"
+#define XBOXINPUT_PROBE_ROTATE_FILENAME "XboxInputCompatProbe.rotate.log"
 #define XBOXINPUT_PRIVATE_DRIVE       "XboxInputCfg:"
 
 static char g_xboxInputConfigPath[MAX_PATH] = "HDD:\\XboxInput.ini";

@@ -48,6 +48,8 @@ void XboxInputPublishMapping(const XboxInputMappingOptions* mapping);
 void XboxInputSetDefaultMapping(XboxInputMappingOptions* mapping);
 void XboxInputApplyGamepadMapping(const XboxInputGipGamepadState* input,
 	const XboxInputMappingOptions* mapping, XboxInputGipGamepadState* output);
+// Converts the XInput-derived 0..255 motor value to GIP's 0..100 magnitude
+// while applying the user's 0..100 strength percentage.
 uint8_t XboxInputScaleRumble(uint8_t motor, uint8_t percent);
 
 // Names are case-insensitive. "None" is accepted as an unbound target.

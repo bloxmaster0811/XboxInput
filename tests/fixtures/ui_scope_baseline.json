@@ -1,0 +1,463 @@
+{
+  "formatVersion": 1,
+  "baseline": "Test30; input/output runtime files also match Test26",
+  "outsideUiSha256": "E1A9ED76BDD1164CD75D95FDAC15502377C0DB15A1FD2A222BC493859894C57A",
+  "nativeNotificationSha256": "402830C870B71EAEB6460FD293BDB807021D4A58F928CC55E8DF974180BF09F4",
+  "files": [
+    {
+      "path": "controller_backend.cpp",
+      "kind": "text-lf",
+      "sha256": "D901B68882EB56E3ADD7E8DAA8648494614E837E42C2747702FE33FBE8E5E522"
+    },
+    {
+      "path": "controller_backend.h",
+      "kind": "text-lf",
+      "sha256": "1FCD379BD3FCD41F7C0C34790CB0DB7F12719A1BFEEDE7E211EBF1F059C213E6"
+    },
+    {
+      "path": "Detours.cpp",
+      "kind": "text-lf",
+      "sha256": "10E8DCF1B4DA33936E631ADCEB76147CB068603C52FA41D20FCFDA4B948FF2E3"
+    },
+    {
+      "path": "Detours.h",
+      "kind": "text-lf",
+      "sha256": "D6159ACB8A17C698EA3A1650E051545951E03EC1B89CE7F0D7723306C5A1003B"
+    },
+    {
+      "path": "gamepad_mapping.cpp",
+      "kind": "text-lf",
+      "sha256": "90D5D098A4158548864D1EEDCC0202DD6369FE8E0FA5A158B320FCECA824EA2F"
+    },
+    {
+      "path": "gamepad_mapping.h",
+      "kind": "text-lf",
+      "sha256": "0E5C32F86A4E4ABF7B76DF444059D209E0DE895A997AEAABA178598E93C2834F"
+    },
+    {
+      "path": "gip_gamepad_parser.cpp",
+      "kind": "text-lf",
+      "sha256": "BB12B287276229ACBE9A0A9669114A44620199763F4501A117192BD5BB93E3CA"
+    },
+    {
+      "path": "gip_gamepad_parser.h",
+      "kind": "text-lf",
+      "sha256": "3800F79B6D2FDAE26FE721714141DC8ECB5ADBDF49A68654E99F4ED7FC502017"
+    },
+    {
+      "path": "gip_input_readiness.h",
+      "kind": "text-lf",
+      "sha256": "481FD31A44DA53C6182C74C00E6D0D5253A7975E27B5251A48C2A5E6C5FCDD6C"
+    },
+    {
+      "path": "gip_output_policy.h",
+      "kind": "text-lf",
+      "sha256": "50DDD796020FE3AEDC4A49BF17BAD9987062F30355FC09B33A344C655D2CE350"
+    },
+    {
+      "path": "gip_output_queue.h",
+      "kind": "text-lf",
+      "sha256": "2674588CDD6A8CC20E33BED4811F56FE18DEFBDF15F17D41FCBD0B96F4F4B070"
+    },
+    {
+      "path": "gip_output_trace.h",
+      "kind": "text-lf",
+      "sha256": "BC49E71AC51921B34BE1B6B5DD05C89045022289B9F3395A262CD30C6425C650"
+    },
+    {
+      "path": "gip_output_transport.inl",
+      "kind": "text-lf",
+      "sha256": "8B55AB4F1D2941785537B014453973EFA466DB51C057381813B092700EC76D47"
+    },
+    {
+      "path": "gip_protocol.h",
+      "kind": "text-lf",
+      "sha256": "9BBB528B40EF42A635635C9CB0EAB36F98528ECD847D8D7E59F6411BC57A57BB"
+    },
+    {
+      "path": "hid_parser.cpp",
+      "kind": "text-lf",
+      "sha256": "9D9EBE170EE25EC088487BA3E13CEDDE115FDF9BB2C07091D16D47BB797B97EB"
+    },
+    {
+      "path": "hid_parser.h",
+      "kind": "text-lf",
+      "sha256": "F551540E59EC29FCD48018E44A304D3D263933F9A770E9C165B4AD95E7C0B955"
+    },
+    {
+      "path": "mapping.cpp",
+      "kind": "text-lf",
+      "sha256": "AA78F469B0C5B200B20B8A598679D577D6E7EF34390977A93FB80D921F985883"
+    },
+    {
+      "path": "mapping.h",
+      "kind": "text-lf",
+      "sha256": "8FDE8D70D0E9F4DB2976FF8C68CF7CAA1379726EB45F5D195E4C9CCBA55D2291"
+    },
+    {
+      "path": "rapidjson/allocators.h",
+      "kind": "text-lf",
+      "sha256": "574FB8BEBF000C3A4779FE200B37CBCFABF9D028CD04A0E2ED633F757060C0EC"
+    },
+    {
+      "path": "rapidjson/document.h",
+      "kind": "text-lf",
+      "sha256": "DA02371E1747E869C56FBE0A66D66630AEFBEFEE6D615740F2895342C924FC8C"
+    },
+    {
+      "path": "rapidjson/encodedstream.h",
+      "kind": "text-lf",
+      "sha256": "B44479A6E74FF0A5C461DEBD10DE5A48810989E9565E6B1F20523A8449C39CCB"
+    },
+    {
+      "path": "rapidjson/encodings.h",
+      "kind": "text-lf",
+      "sha256": "4CC11051FCA0F274FE3A296987DE98D9D99174CD94AAF274652CAB4C1C6F586F"
+    },
+    {
+      "path": "rapidjson/error/en.h",
+      "kind": "text-lf",
+      "sha256": "5D040327A5B7B50367F5862FE88E9D742BCEFCFF52450279BFEBB89A30072D2D"
+    },
+    {
+      "path": "rapidjson/error/error.h",
+      "kind": "text-lf",
+      "sha256": "97563D14F2D7D5EEE7BA73149B66034D3612C0E0358D0D591F9FAA5D4C926F0A"
+    },
+    {
+      "path": "rapidjson/filereadstream.h",
+      "kind": "text-lf",
+      "sha256": "7AD99895D5DEEF0AD98993D09C6386880AB833962C1D886E6A11DE45C74C32D4"
+    },
+    {
+      "path": "rapidjson/filewritestream.h",
+      "kind": "text-lf",
+      "sha256": "5F64E24E43823C5B0D3ADF5B43C17C1FBE70DDD2F9FAAF4C9D9639789E779841"
+    },
+    {
+      "path": "rapidjson/fwd.h",
+      "kind": "text-lf",
+      "sha256": "06A7B142B7B0E1D2B773E657BBAFD9B861E4B0A17FADF49A806D8833AC6D557E"
+    },
+    {
+      "path": "rapidjson/internal/biginteger.h",
+      "kind": "text-lf",
+      "sha256": "3E139846902741C8A18DA9E2BE9D79F98D0A44E8966DF41AE37910D49642EC83"
+    },
+    {
+      "path": "rapidjson/internal/diyfp.h",
+      "kind": "text-lf",
+      "sha256": "EA94D97853CB1F4DFB6D14314386AF71BAE61D7BA015CC942C97C7116FBB599C"
+    },
+    {
+      "path": "rapidjson/internal/dtoa.h",
+      "kind": "text-lf",
+      "sha256": "36D9E86E6C2968BF839A73E69FC7AC149BA8E0EA1F667F82CC9B80241F7C111E"
+    },
+    {
+      "path": "rapidjson/internal/ieee754.h",
+      "kind": "text-lf",
+      "sha256": "AE0A4FF88545BF762E659079BC35A0AD274C8CE9F46DBDF8BD034DE749A46699"
+    },
+    {
+      "path": "rapidjson/internal/itoa.h",
+      "kind": "text-lf",
+      "sha256": "B4D2564F0F6E44505142F0E553370D6018D470C9CC3896A1EAE93F18A2BAF2F3"
+    },
+    {
+      "path": "rapidjson/internal/meta.h",
+      "kind": "text-lf",
+      "sha256": "24D25DC872A13B7DF5CB0B80C704EF1E06792CEAA6595A84BB63B3ECCE615E45"
+    },
+    {
+      "path": "rapidjson/internal/pow10.h",
+      "kind": "text-lf",
+      "sha256": "6B8787ECC984887CC2579D7043C08AC57614B8C59E09073565538890DCD1FF21"
+    },
+    {
+      "path": "rapidjson/internal/regex.h",
+      "kind": "text-lf",
+      "sha256": "38B53A5FA8EF845B577704741B531D14D4327B885950631CCB2C3D8687ADFF19"
+    },
+    {
+      "path": "rapidjson/internal/stack.h",
+      "kind": "text-lf",
+      "sha256": "9608F057F67FCBABD6CDC7AE35B0E6130B430DEECF47D0C3670FD27EAE806861"
+    },
+    {
+      "path": "rapidjson/internal/strfunc.h",
+      "kind": "text-lf",
+      "sha256": "A280976EEDCC3B0CF4E73E96F809EA62B945B577D62DF72A6E3C13F02ABAA036"
+    },
+    {
+      "path": "rapidjson/internal/strtod.h",
+      "kind": "text-lf",
+      "sha256": "344940DFC5936F2F4F967C4063D84DA8FB3021CDDB727D0E108B12E17AD0D6E6"
+    },
+    {
+      "path": "rapidjson/internal/swap.h",
+      "kind": "text-lf",
+      "sha256": "1403BD099A25621C63A1234CA61DAAE0444F1538C4BE7B193694CF41A76F14AC"
+    },
+    {
+      "path": "rapidjson/istreamwrapper.h",
+      "kind": "text-lf",
+      "sha256": "6B370F558C1768789CE64A9015703685F5BC785B6C68278041147FC9B2D6387F"
+    },
+    {
+      "path": "rapidjson/memorybuffer.h",
+      "kind": "text-lf",
+      "sha256": "CBFB33D4B2B826012C9932A664044CD70606EBD938BA9E35748892DE2569E03F"
+    },
+    {
+      "path": "rapidjson/memorystream.h",
+      "kind": "text-lf",
+      "sha256": "5381DD5981676DC6194CB384AF6BCF623D9DEE46B9B1508BD1E62C7CF3EFAC9F"
+    },
+    {
+      "path": "rapidjson/msinttypes/inttypes.h",
+      "kind": "text-lf",
+      "sha256": "78EE41FD99BCBE59CA93F6A870A83C0A90F4B179AF571F6E684F2600491BBAE7"
+    },
+    {
+      "path": "rapidjson/msinttypes/stdint.h",
+      "kind": "text-lf",
+      "sha256": "BF2D1BC4885BC1E0720EC9AF8F399477C7E105AE1E70E2863C31A8123CAE1C17"
+    },
+    {
+      "path": "rapidjson/ostreamwrapper.h",
+      "kind": "text-lf",
+      "sha256": "8AB62EB2967A965B4B39BD03AE49C220E7A6CD6C5C680F39CB32EF652B2C3337"
+    },
+    {
+      "path": "rapidjson/pointer.h",
+      "kind": "text-lf",
+      "sha256": "C0F4BF66F0AE482C240AED4A22708DA0C4E90F2944B47F8D22688C5FCBAF039C"
+    },
+    {
+      "path": "rapidjson/prettywriter.h",
+      "kind": "text-lf",
+      "sha256": "BCFD65F5E1169942DD5819384794DB251855824754187B817A7CD6B0465F7DF4"
+    },
+    {
+      "path": "rapidjson/rapidjson.h",
+      "kind": "text-lf",
+      "sha256": "F2A9AF92F880EC8ED2DDC0FF9AE6D6F15ADFA9137EAAC9658BFE39ECDEBC21F0"
+    },
+    {
+      "path": "rapidjson/reader.h",
+      "kind": "text-lf",
+      "sha256": "7825CD236782B26C3DF953B30623218805B7C2FAA66FF1029321C9F0030C841D"
+    },
+    {
+      "path": "rapidjson/schema.h",
+      "kind": "text-lf",
+      "sha256": "F3FF069AB5AF883371919642D06AF4831798CA16028380947404D3D8CDA6A6A6"
+    },
+    {
+      "path": "rapidjson/stream.h",
+      "kind": "text-lf",
+      "sha256": "84D03FE1BB5293EE416A6340E4BE9B4E0F63C5DC064E2BA902FCC1694D1E1E8E"
+    },
+    {
+      "path": "rapidjson/stringbuffer.h",
+      "kind": "text-lf",
+      "sha256": "C7B50A0D3F98F7BD7F66BEA78B3F94A8441F6E7669188F52E07D495E63F34CCA"
+    },
+    {
+      "path": "rapidjson/writer.h",
+      "kind": "text-lf",
+      "sha256": "07EA1608318A1FA220A2DD09A553E9E524485102ADD3829B6E3F550004F8A6A2"
+    },
+    {
+      "path": "usb.h",
+      "kind": "text-lf",
+      "sha256": "A9450A36ED53AF8D59887FF53E86E5238E614733E9D6BBD6B6C8FA460A6EB041"
+    },
+    {
+      "path": "xboxinput_config.h",
+      "kind": "text-lf",
+      "sha256": "C3B85E2C488C911425A24B75AE330A0DF8339A05BFB3F8FDAA65B99B57A667B7"
+    },
+    {
+      "path": "XboxInput.vcxproj",
+      "kind": "text-lf",
+      "sha256": "C1A37DF54EA8DF4FA7BAE8057807B4531A5AEB108B402437E19AA27EAB509BAF"
+    },
+    {
+      "path": "XboxInput.vcxproj.filters",
+      "kind": "text-lf",
+      "sha256": "8F41CE3C13490D1013FDA2C9059F4C17653C8E967181A8443B37C54FDFFD0DBE"
+    },
+    {
+      "path": "xex.xml",
+      "kind": "text-lf",
+      "sha256": "3B3E4BAE43225C3CC53A0BB421E3BA6D800EF813D3788F7F43F1674CBDBC49A1"
+    },
+    {
+      "path": "xkelib/exttypes.h",
+      "kind": "text-lf",
+      "sha256": "C6021C3F2EF046E5B8BF7AAEC96BBB4EAD99BF8772B36375AE51AC8AEF8B40C7"
+    },
+    {
+      "path": "xkelib/kernel/_kernelext.h",
+      "kind": "text-lf",
+      "sha256": "437A8FED5424A617B3EEC3FBBBAE6B4AE006347891313CDB442737BAACDCAAEE"
+    },
+    {
+      "path": "xkelib/kernel/console_type.h",
+      "kind": "text-lf",
+      "sha256": "D32D245320C6480C3D563D57CF4EA2F18052D77EDB2C6621FD3DAD35EBCBEA88"
+    },
+    {
+      "path": "xkelib/kernel/keFileInfo.h",
+      "kind": "text-lf",
+      "sha256": "80B7B1D56E686FE55F3C6CF9FE7DA93B582E319EAFFE88299CC7282E07F56253"
+    },
+    {
+      "path": "xkelib/kernel/keNand.h",
+      "kind": "text-lf",
+      "sha256": "B4E40670E20C1359FC1F5A1323D42B7DEE036F8BE7D1E745ADCCBD4209FBB9DD"
+    },
+    {
+      "path": "xkelib/kernel/kePrivateStructs.h",
+      "kind": "text-lf",
+      "sha256": "D15CE810FDC93EA5DA9EFC3807CD54CF26F288D7983049F2ED427C44DBBC242C"
+    },
+    {
+      "path": "xkelib/kernel/kernelext20871.0.def",
+      "kind": "text-lf",
+      "sha256": "A4313BF992ACE031957A9A8F21EE774346BA1D0FDFC906DC6DE6A948E0AEE6A2"
+    },
+    {
+      "path": "xkelib/kernel/kernelext21119.0.def",
+      "kind": "text-lf",
+      "sha256": "2F27A6930EAD74F8B75D2BAAA92F7459B28CD9290B1F8BCF891035F88B54605F"
+    },
+    {
+      "path": "xkelib/kernel/kernelext21173.0.def",
+      "kind": "text-lf",
+      "sha256": "68C4950CC3A3A11C456AFF68681F9B16384B05C317FDC46DB909810600CE311C"
+    },
+    {
+      "path": "xkelib/kernel/kernelext21250.0.def",
+      "kind": "text-lf",
+      "sha256": "FCB7F772E147AE9CFB9607A789E7AE5C6EA9EF7B1234F43A22D57555E27C4781"
+    },
+    {
+      "path": "xkelib/kernel/kernelext21256.0.def",
+      "kind": "text-lf",
+      "sha256": "E1C8C464F41B0C77952EC0A4299A50158CDB7F6F176C16426615C1F82A875E54"
+    },
+    {
+      "path": "xkelib/kernel/keSmc.h",
+      "kind": "text-lf",
+      "sha256": "4F88A999D2A0CF8EDE6193E7C697D14DBC6BFAE8B4DB775CE0350AD18D996FD1"
+    },
+    {
+      "path": "xkelib/kernel/keXConfig.h",
+      "kind": "text-lf",
+      "sha256": "272A08D7833EBA63E9EDB21CA719E13C59D19502F32DAD531A93167558D334BF"
+    },
+    {
+      "path": "xkelib/kernel/keXeCrypt.h",
+      "kind": "text-lf",
+      "sha256": "6A531B5C784233B49679E75BF31829B286E6C471BFBF6A9F729B6B779A1D90B1"
+    },
+    {
+      "path": "xkelib/kernel/keXeKeys.h",
+      "kind": "text-lf",
+      "sha256": "4C56464C730D44AFDC34BD91C56E909150F483D3E9A08622C83DAFFCE77CA4D3"
+    },
+    {
+      "path": "xkelib/kernel/keXexInfo.h",
+      "kind": "text-lf",
+      "sha256": "FA26E21AFB49D80545CA41C1D3C7A6EEECD50CE504E03CC01BD09ECCD9910EB9"
+    },
+    {
+      "path": "xkelib/kernelext.exp",
+      "kind": "text-lf",
+      "sha256": "CAD314A59C0D5B5F88B2B7174AB82DC06A3475FCFF484735FFF8D9C86B172BB6"
+    },
+    {
+      "path": "xkelib/kernelext.lib",
+      "kind": "binary",
+      "sha256": "36D2D15BB730C322B15DB1060E6E587428F8074E16F32D5C2040DD04BCEC84A6"
+    },
+    {
+      "path": "xkelib/syssock.h",
+      "kind": "text-lf",
+      "sha256": "932BC5B6AC3961081BDDB7DED5073D798B98B130F7F2B99558E59576E054A278"
+    },
+    {
+      "path": "xkelib/xam/_xamext.h",
+      "kind": "text-lf",
+      "sha256": "6CFE73F3E3D07AB9D329CF616F375F58920B1BA0D2E6FAE82032318ADC955806"
+    },
+    {
+      "path": "xkelib/xam/xamext20871.0.def",
+      "kind": "text-lf",
+      "sha256": "124188E1FCFFFF2E03C168AD2BB3DF6B6F60A27F1C75F5FF9D459B79EDF073E5"
+    },
+    {
+      "path": "xkelib/xam/xamext21119.0.def",
+      "kind": "text-lf",
+      "sha256": "E9BBF17AF73135971A1E78959D59A55A1004411FCCB902FFBF2D1EE4060CDF9D"
+    },
+    {
+      "path": "xkelib/xam/xamext21173.0.def",
+      "kind": "text-lf",
+      "sha256": "F8C4291BA66B9643F2AE84AD2B2E8A2575969681010B1A3AFA88395B4AD44F08"
+    },
+    {
+      "path": "xkelib/xam/xamext21250.0.def",
+      "kind": "text-lf",
+      "sha256": "8BD2E1FFC490E6D147884D75640BB1AC968C019862D5CECA43D363949D98BC77"
+    },
+    {
+      "path": "xkelib/xam/xamext21256.0.def",
+      "kind": "text-lf",
+      "sha256": "B91B6E393B751782636D7CC2962C7EAFD4917241554BDC1299229CEDEB95C16C"
+    },
+    {
+      "path": "xkelib/xam/xamNet.h",
+      "kind": "text-lf",
+      "sha256": "BD74BF4EE773F6F6F4BF0D16D87F07DCA37C97A5A07411396E3A6C8D542ABEC7"
+    },
+    {
+      "path": "xkelib/xam/xamTask.h",
+      "kind": "text-lf",
+      "sha256": "4373824618C674B360C96F84DFE4D2CB1ADF49A1FAD48C8ACC522333EC5385DE"
+    },
+    {
+      "path": "xkelib/xam/xamXContent.h",
+      "kind": "text-lf",
+      "sha256": "09476EACBB7773DB8398BEFF275B98FABD02BA90F03CFA96CA687424E63C0446"
+    },
+    {
+      "path": "xkelib/xamext.exp",
+      "kind": "text-lf",
+      "sha256": "0AA615E3108F21F1765AB3E9A16F488E936423E1553D569584FCA5331BAADAF6"
+    },
+    {
+      "path": "xkelib/xamext.lib",
+      "kind": "binary",
+      "sha256": "34EDBB8B78D1BF7E24BF2D9DA2E8C080AF3033749CD39BA9A02426FD86CEC20D"
+    },
+    {
+      "path": "xkelib/xapiext.h",
+      "kind": "text-lf",
+      "sha256": "10192057A5CE7A8EA246308E34674EBB2D7F8655749FD0F478EAC76EEE5BE348"
+    },
+    {
+      "path": "xkelib/xkelib.h",
+      "kind": "text-lf",
+      "sha256": "A78760C924F1D9B23FAFCC72878B61F0DBFFB99D53C4B2F98F7D5A4F8E676717"
+    },
+    {
+      "path": "xkelib/xkelib.lib",
+      "kind": "binary",
+      "sha256": "6B30CF0A66D1777CAB53D9542EF30F271E6D68A7A9D55DDE6F73318A36B5521C"
+    }
+  ]
+}

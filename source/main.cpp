@@ -14,7 +14,19 @@
 #include "usb.h"
 #include "mapping.h"
 #include "gip_protocol.h"
+#include "gip_output_queue.h"
+#include "gip_output_trace.h"
+#include "gip_output_policy.h"
+#include "gip_input_readiness.h"
 #include "xboxinput_config.h"
+#include "title_worker_policy.h"
+
+static void* g_xboxInputIsXbox1TitleId = nullptr; // XAM ordinal 447, optional UI only.
+static PLDR_DATA_TABLE_ENTRY* g_xboxInputExecutableModule = nullptr; // Kernel data export 403.
+typedef PVOID(*xboxinput_header_field_t)(PVOID, DWORD);
+static xboxinput_header_field_t g_xboxInputHeaderField = nullptr; // Kernel export 299.
+static volatile LONG g_xboxInputUiGateModule = 0;
+static volatile LONG g_xboxInputUiGatePhase = -1;
 
 extern "C" void* _ReturnAddress(void);
 #pragma intrinsic(_ReturnAddress)
@@ -113,7 +125,7 @@ static const char* XboxInputKnownControllerName(uint16_t vid, uint16_t pid);
 
 // USB callbacks can run above PASSIVE_LEVEL, so they queue compact events here.
 // The existing logger thread is the only code that writes them to HDD.
-#define XBOXINPUT_LOG_EVENT_COUNT 128
+#define XBOXINPUT_LOG_EVENT_COUNT 512
 enum XboxInputLogEventType {
 	XBOXINPUT_LOG_CONTROLLER_DETECTED = 1,
 	XBOXINPUT_LOG_CONTROLLER_READY = 2,
@@ -127,7 +139,24 @@ enum XboxInputLogEventType {
 	XBOXINPUT_LOG_PROFILE_DECISION = 10,
 	XBOXINPUT_LOG_NOTIFICATION_CANCELLED = 11,
 	XBOXINPUT_LOG_CONFIG_PATH = 12,
+	XBOXINPUT_LOG_OUTPUT = 13,
+	XBOXINPUT_LOG_OUTPUT_TRACE = 14,
+	XBOXINPUT_LOG_TITLE_UI_GATE = 15,
 };
+
+static void GipLogOutputDiagnostics(DWORD now);
+
+static const char* XboxInputOutputPhaseName(DWORD phase) {
+ switch (phase) {
+ case 1: return "submit";
+ case 2: return "complete";
+ case 3: return "summary";
+ case 4: return "outstanding_over_1s";
+ case 5: return "rejected";
+ case 6: return "queue_return_token";
+ default: return "unknown";
+ }
+}
 
 enum XboxInputInitStep {
 	XBOXINPUT_INIT_ENTRY = 1,
@@ -174,6 +203,8 @@ enum XboxInputUsbStep {
 	XBOXINPUT_USB_INIT_RUMBLE_SETUP_QUEUED,
 	XBOXINPUT_USB_INIT_RUMBLE_SETUP_COMPLETE,
 	XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE,
+	XBOXINPUT_USB_RUNTIME_RUMBLE_QUEUED,
+	XBOXINPUT_USB_RUNTIME_RUMBLE_COMPLETE,
 	XBOXINPUT_USB_POWERA_STAGE = 100,
 };
 struct XboxInputLogEvent {
@@ -186,6 +217,55 @@ struct XboxInputLogEvent {
 	DWORD value4;
 	DWORD value5;
 };
+static void XboxInputWriteOutputTrace(FILE* file, const XboxInputLogEvent* event) {
+ const DWORD phase = event->value1 >> 24;
+ static const char* const names[] = { "unknown", "submit_enter", "submit_buffer",
+  "submit_return", "callback_observed", "mailbox_consumed", "transfer_finished",
+  "stop_requested_while_stalled", "watchdog", "watchdog_counts", "watchdog_mailbox",
+  "watchdog_last_callback", "watchdog_worker", "unmatched_callback", "watchdog_motors",
+  "runtime_rumble_requests", "dpc_handoff_failed" };
+ fprintf(file, "tick=%lu event=output_trace phase=%s session=%u user=%u command=%02X transfer=%lu ",
+  event->tick, phase < ARRAYSIZE(names) ? names[phase] : names[0],
+  (BYTE)(event->value1 >> 16), (BYTE)(event->value1 >> 8), (BYTE)event->value1, event->value2);
+ const DWORD a = event->value3, b = event->value4, c = event->value5;
+ switch (phase) {
+ case XBOXINPUT_TRACE_ENTER:
+  fprintf(file, "trb=%08X endpoint=%08X length=%u sequence=%u wireMotors=%04X", a, b, c >> 24, (c >> 16) & 255, c & 65535); break;
+ case XBOXINPUT_TRACE_BUFFER:
+  fprintf(file, "buffer=%08X callback=%08X flags=%08X", a, b, c); break;
+ case XBOXINPUT_TRACE_RETURN:
+  fprintf(file, "token=%08X callMs=%lu mailboxPending=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_CALLBACK:
+  fprintf(file, "status=%08X mailboxBeforePublish=%lu callbacks=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_CONSUMED:
+  fprintf(file, "status=%08X accepted=%lu callbacksConsumed=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_FINISHED:
+  fprintf(file, "status=%08X completed=%lu unexpectedCompletions=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_STOP:
+  fprintf(file, "desired=%04X activeMotors=%04X ageMs=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_WATCHDOG:
+  fprintf(file, "ageMs=%lu submitted=%lu state=%08X", a, b, c); break;
+ case XBOXINPUT_TRACE_COUNTS:
+  fprintf(file, "entered=%lu returned=%lu callbacks=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_MAILBOX:
+  fprintf(file, "lastCallbackTransfer=%lu mailboxPending=%lu callbacksConsumed=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_LAST_CALLBACK:
+  fprintf(file, "callbackTick=%lu status=%08X mailboxBeforePublish=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_WORKER:
+  fprintf(file, "workerTick=%lu token=%08X returnTick=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_UNMATCHED:
+  fprintf(file, "trb=%08X status=%08X count=%lu", a, b, c); break;
+ case XBOXINPUT_TRACE_MOTORS:
+  fprintf(file, "desired=%04X activeMotors=%04X completedMotors=%04X", a, b, c); break;
+ case XBOXINPUT_TRACE_SUPPRESSED:
+  fprintf(file, "acceptedRequests=%lu nonzeroRequests=%lu requestedMotors=%04X suppressRuntimeRumble=%u forceZeroWireRumble=%u", a, b, c,
+   (DWORD)XBOXINPUT_SUPPRESS_RUNTIME_RUMBLE, (DWORD)XBOXINPUT_FORCE_ZERO_WIRE_RUMBLE); break;
+ case XBOXINPUT_TRACE_DPC_FAILURE:
+  fprintf(file, "status=%08X submitted=%lu completed=%lu outputStopped=1", a, b, c); break;
+ default: fprintf(file, "a=%08X b=%08X c=%08X", a, b, c); break;
+ }
+ fprintf(file, "\r\n");
+}
 static volatile LONG g_xboxInputLogEventSerial = 0;
 static XboxInputLogEvent g_xboxInputLogEvents[XBOXINPUT_LOG_EVENT_COUNT];
 static volatile LONG g_xboxInputRemovedUserMask = 0;
@@ -347,9 +427,13 @@ static const char* XboxInputUsbStepName(DWORD step) {
 	case XBOXINPUT_USB_INIT_RUMBLE_SETUP_QUEUED: return "init_rumble_setup_queued";
 	case XBOXINPUT_USB_INIT_RUMBLE_SETUP_COMPLETE: return "init_rumble_setup_complete";
 	case XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE: return "post_identify_startup_complete";
+	case XBOXINPUT_USB_RUNTIME_RUMBLE_QUEUED: return "runtime_rumble_queued";
+	case XBOXINPUT_USB_RUNTIME_RUMBLE_COMPLETE: return "runtime_rumble_complete";
 	default: return step >= XBOXINPUT_USB_POWERA_STAGE ? "powera_init_stage" : "unknown";
 	}
 }
+
+static bool XboxInputFinishLogWrite(FILE* file);
 
 static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
 	const DWORD pathCount = sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0]);
@@ -414,15 +498,135 @@ static FILE* XboxInputOpenLog(bool compatibilityProbe, const char* mode) {
 	return NULL;
 }
 
-static void XboxInputLogReset() {
-	FILE* file = XboxInputOpenLog(false, "w");
-	if (file)
-		fclose(file);
+// Return the path chosen by XboxInputOpenLog after its harmless append-mode
+// probe. Keeping this separate from the probe avoids truncating the prior
+// session before it has been moved aside.
+static const char* XboxInputSelectedLogPath(bool compatibilityProbe) {
+	LONG selected = g_xboxInputLogPathIndex;
+	const DWORD pathCount = sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0]);
+	if (selected == XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX) {
 #ifdef XBOXINPUT_COMPAT_PROBE
-	file = XboxInputOpenLog(true, "w");
-	if (file)
-		fclose(file);
+		return compatibilityProbe ? XBOXINPUT_PROBE_PATH : XBOXINPUT_LOG_PATH;
+#else
+		UNREFERENCED_PARAMETER(compatibilityProbe);
+		return XBOXINPUT_LOG_PATH;
 #endif
+	}
+	if (selected >= 0 && (DWORD)selected < pathCount) {
+#ifdef XBOXINPUT_COMPAT_PROBE
+		return compatibilityProbe ? kXboxInputCompatProbeLogPaths[selected]
+			: kXboxInputLogPaths[selected];
+#else
+		UNREFERENCED_PARAMETER(compatibilityProbe);
+		return kXboxInputLogPaths[selected];
+#endif
+	}
+	return NULL;
+}
+
+static bool XboxInputBuildLogSiblingPath(const char* currentPath,
+	const char* filename, char* destination, size_t capacity) {
+	if (!currentPath || !filename || !destination || capacity == 0)
+		return false;
+	const char* slash = strrchr(currentPath, '\\');
+	const char* forwardSlash = strrchr(currentPath, '/');
+	if (!slash || (forwardSlash && forwardSlash > slash))
+		slash = forwardSlash;
+	if (!slash)
+		return false;
+	size_t prefixLength = (size_t)(slash - currentPath) + 1;
+	if (prefixLength + strlen(filename) + 1 > capacity)
+		return false;
+	memcpy(destination, currentPath, prefixLength);
+	strcpy(destination + prefixLength, filename);
+	return true;
+}
+
+static bool XboxInputLogHasContent(const char* path) {
+	FILE* file = path ? fopen(path, "rb") : NULL;
+	if (!file)
+		return false;
+	int character = fgetc(file);
+	fclose(file);
+	return character != EOF;
+}
+
+// A crash normally prevents the tester from copying the log until after a
+// reset. Preserve the complete preceding session before opening a fresh log.
+// The temporary name makes the rotation recoverable if power is lost between
+// renames: the next boot promotes the pending file before it starts logging.
+static bool XboxInputRotateLogForPreviousSession(const char* currentPath,
+	bool compatibilityProbe, bool* preservedPrevious, char* previousPath,
+	size_t previousPathCapacity) {
+	if (preservedPrevious)
+		*preservedPrevious = false;
+	if (previousPath && previousPathCapacity)
+		previousPath[0] = 0;
+
+	const char* previousName = compatibilityProbe
+		? XBOXINPUT_PREVIOUS_PROBE_FILENAME : XBOXINPUT_PREVIOUS_LOG_FILENAME;
+	const char* pendingName = compatibilityProbe
+		? XBOXINPUT_PROBE_ROTATE_FILENAME : XBOXINPUT_LOG_ROTATE_FILENAME;
+	char previous[MAX_PATH];
+	char pending[MAX_PATH];
+	if (!XboxInputBuildLogSiblingPath(currentPath, previousName, previous, sizeof(previous)) ||
+		!XboxInputBuildLogSiblingPath(currentPath, pendingName, pending, sizeof(pending)))
+		return false;
+
+	// Finish an interrupted earlier rotation before looking at this session.
+	if (XboxInputLogHasContent(pending)) {
+		remove(previous);
+		if (rename(pending, previous) != 0)
+			return false;
+	}
+
+	if (!XboxInputLogHasContent(currentPath))
+		return true; // First log on this storage root; there is no session to retain.
+
+	// Do not overwrite the previous crash log until the current one is safely in
+	// the pending name. If either final step is interrupted, pending is recovered
+	// on the next boot above.
+	remove(pending);
+	if (rename(currentPath, pending) != 0)
+		return false;
+	remove(previous);
+	if (rename(pending, previous) != 0)
+		return false;
+
+	if (preservedPrevious)
+		*preservedPrevious = true;
+	if (previousPath && previousPathCapacity) {
+		strncpy(previousPath, previous, previousPathCapacity - 1);
+		previousPath[previousPathCapacity - 1] = 0;
+	}
+	return true;
+}
+
+static FILE* XboxInputOpenStartupLog(bool compatibilityProbe,
+	bool* preservedPrevious, bool* usedAppendFallback, char* previousPath,
+	size_t previousPathCapacity) {
+	if (usedAppendFallback)
+		*usedAppendFallback = false;
+	// "a" is a non-truncating write-access probe. XboxInputOpenLog records the
+	// selected root, after which the current file can be safely rotated there.
+	FILE* probe = XboxInputOpenLog(compatibilityProbe, "a");
+	if (!probe)
+		return NULL;
+	if (!XboxInputFinishLogWrite(probe))
+		return NULL;
+	const char* selectedPath = XboxInputSelectedLogPath(compatibilityProbe);
+	if (!selectedPath)
+		return NULL;
+	if (!XboxInputRotateLogForPreviousSession(selectedPath, compatibilityProbe,
+		preservedPrevious, previousPath, previousPathCapacity)) {
+		// A filesystem that cannot rename must never prevent diagnostics (or the
+		// plugin) from starting. Keep the old session and append a clearly marked
+		// new header instead; it is still recoverable after a crash.
+		if (usedAppendFallback)
+			*usedAppendFallback = true;
+		return fopen(selectedPath, "a");
+	}
+	return fopen(selectedPath, "w");
 }
 
 static void XboxInputSetDiagStage(LONG stage) {
@@ -647,9 +851,25 @@ static void XboxInputMirrorLogsToOtherStorage() {
 	for (DWORD n = 0; n < sizeof(usbPathIndices) / sizeof(usbPathIndices[0]); ++n) {
 		DWORD i = usbPathIndices[n];
 		XboxInputMirrorOneLog(kXboxInputLogPaths[0], kXboxInputLogPaths[i]);
+		char previousSource[MAX_PATH];
+		char previousDestination[MAX_PATH];
+		if (XboxInputBuildLogSiblingPath(kXboxInputLogPaths[0],
+			XBOXINPUT_PREVIOUS_LOG_FILENAME, previousSource, sizeof(previousSource)) &&
+			XboxInputBuildLogSiblingPath(kXboxInputLogPaths[i],
+				XBOXINPUT_PREVIOUS_LOG_FILENAME, previousDestination, sizeof(previousDestination))) {
+			XboxInputMirrorOneLog(previousSource, previousDestination);
+		}
 #ifdef XBOXINPUT_COMPAT_PROBE
 		XboxInputMirrorOneLog(kXboxInputCompatProbeLogPaths[0],
 			kXboxInputCompatProbeLogPaths[i]);
+		char previousProbeSource[MAX_PATH];
+		char previousProbeDestination[MAX_PATH];
+		if (XboxInputBuildLogSiblingPath(kXboxInputCompatProbeLogPaths[0],
+			XBOXINPUT_PREVIOUS_PROBE_FILENAME, previousProbeSource, sizeof(previousProbeSource)) &&
+			XboxInputBuildLogSiblingPath(kXboxInputCompatProbeLogPaths[i],
+				XBOXINPUT_PREVIOUS_PROBE_FILENAME, previousProbeDestination, sizeof(previousProbeDestination))) {
+			XboxInputMirrorOneLog(previousProbeSource, previousProbeDestination);
+		}
 #endif
 	}
 }
@@ -658,21 +878,38 @@ static DWORD XboxInputLogThread(PVOID) {
 	// Storage devices are not guaranteed to be mounted when DashLaunch calls
 	// DllMain.  Keep retrying forever: a late HDD/USB mount must still result in
 	// a log containing all initialization events retained in the ring.
+	bool historyPrepared = false;
+	bool previousLogPreserved = false;
+	bool logAppendFallback = false;
+	char previousLogPath[MAX_PATH] = { 0 };
 	for (;;) {
 		XboxInputProcessControllerNotifications();
-		FILE* file = XboxInputOpenLog(false, "w");
+		FILE* file = historyPrepared ? XboxInputOpenLog(false, "w") :
+			XboxInputOpenStartupLog(false, &previousLogPreserved,
+				&logAppendFallback,
+				previousLogPath, sizeof(previousLogPath));
 		if (file) {
+			historyPrepared = true;
 			LONG pathIndex = g_xboxInputLogPathIndex;
 			fprintf(file, "XboxInput detailed diagnostic log\r\n");
 			fprintf(file, "build=%s %s kernel=%u ladder=%u\r\n",
 				__DATE__, __TIME__, XboxKrnlVersion->Build,
 				(DWORD)XBOXINPUT_BUILD_LEVEL);
+			fprintf(file, "diagnostics=og-test31-early-emulator-bypass titleUiWorkerStartup=early-name-gated workerAndCleanupGate=1 liveConfigReload=disabled detailedOutputTrace=%u suppressRuntimeRumble=%u forceZeroWireRumble=%u startupOutput=unchanged rumbleDelayMs=%u\r\n",
+				(DWORD)XBOXINPUT_DETAILED_OUTPUT_TRACE, (DWORD)XBOXINPUT_SUPPRESS_RUNTIME_RUMBLE, (DWORD)XBOXINPUT_FORCE_ZERO_WIRE_RUMBLE,
+				(DWORD)XboxInputOutputQueue::RUMBLE_DELAY_MS);
+			fprintf(file, "usbDpcSubmit=%u dpcExport=886 dpcProcessor=%u\r\n",
+				(DWORD)XBOXINPUT_USB_DPC_SUBMIT, (DWORD)XBOXINPUT_USB_DPC_PROCESSOR);
 			fprintf(file, "logPath=%s retryPolicy=continuous eventBuffer=%u privateMount=%u status=%08X\r\n",
 				pathIndex == XBOXINPUT_PLUGIN_LOCAL_LOG_INDEX ? XBOXINPUT_LOG_PATH :
 				((pathIndex >= 0 && pathIndex < (LONG)(sizeof(kXboxInputLogPaths) / sizeof(kXboxInputLogPaths[0])))
 					? kXboxInputLogPaths[pathIndex] : "unknown"),
 				(DWORD)XBOXINPUT_LOG_EVENT_COUNT,
 				(DWORD)(g_xboxInputUsingPrivateMount ? 1 : 0), g_xboxInputPrivateMountStatus);
+			fprintf(file, "previousLog=%s retention=%s\r\n",
+				previousLogPreserved ? previousLogPath : "none",
+				previousLogPreserved ? "preserved" :
+				(logAppendFallback ? "append_fallback" : "none"));
 			if (XboxInputFinishLogWrite(file)) {
 				InterlockedExchange(&g_xboxInputLoggerReady, 1);
 				break;
@@ -681,11 +918,21 @@ static DWORD XboxInputLogThread(PVOID) {
 		Sleep(250);
 	}
 #ifdef XBOXINPUT_COMPAT_PROBE
-	// The normal log selected a writable device. Reset the companion file here,
-	// never in DllMain or a USB callback.
-	FILE* compatReset = XboxInputOpenLog(true, "w");
-	if (compatReset)
+	// The normal log selected a writable device. Rotate the companion file from
+	// the same system thread, never from DllMain or a USB callback.
+	bool previousProbePreserved = false;
+	bool probeAppendFallback = false;
+	char previousProbePath[MAX_PATH] = { 0 };
+	FILE* compatReset = XboxInputOpenStartupLog(true, &previousProbePreserved,
+		&probeAppendFallback,
+		previousProbePath, sizeof(previousProbePath));
+	if (compatReset) {
+		fprintf(compatReset, "previousProbe=%s retention=%s\r\n",
+			previousProbePreserved ? previousProbePath : "none",
+			previousProbePreserved ? "preserved" :
+			(probeAppendFallback ? "append_fallback" : "none"));
 		XboxInputFinishLogWrite(compatReset);
+	}
 #endif
 
 	LONG written = -1;
@@ -734,6 +981,8 @@ static DWORD XboxInputLogThread(PVOID) {
 				}
 			}
 		}
+		// Independent of the output worker: this also reports a blocked queue call.
+		GipLogOutputDiagnostics(GetTickCount());
 		LONG eventSerial = g_xboxInputLogEventSerial;
 		if (eventSerial - writtenEventSerial > XBOXINPUT_LOG_EVENT_COUNT) {
 			LONG dropped = eventSerial - writtenEventSerial - XBOXINPUT_LOG_EVENT_COUNT;
@@ -788,6 +1037,17 @@ static DWORD XboxInputLogThread(PVOID) {
 					fprintf(file, "tick=%lu event=first_input user=%u packet=%u\r\n",
 						event->tick, event->value1, event->value2);
 					break;
+				case XBOXINPUT_LOG_OUTPUT_TRACE:
+					XboxInputWriteOutputTrace(file, event);
+					break;
+				case XBOXINPUT_LOG_OUTPUT:
+					fprintf(file, "tick=%lu event=output phase=%s session=%u user=%u command=%02X value=%08X submitted=%lu completed=%lu queue=%u active=%u stopped=%u rumbleErrors=%u\r\n",
+						event->tick, XboxInputOutputPhaseName(event->value1 >> 24), (BYTE)(event->value1 >> 16),
+						(BYTE)(event->value1 >> 8), (BYTE)event->value1,
+						event->value2, event->value3, event->value4,
+						event->value5 & 0xFF, (event->value5 >> 8) & 1,
+						(event->value5 >> 9) & 1, event->value5 >> 16);
+					break;
 				case XBOXINPUT_LOG_RUMBLE:
 					fprintf(file, "tick=%lu event=rumble user=%u motors=%08X\r\n",
 						event->tick, event->value1, event->value2);
@@ -800,6 +1060,15 @@ static DWORD XboxInputLogThread(PVOID) {
 					fprintf(file, "tick=%lu event=disconnect_notification_cancelled reason=%s remaining=%08X\r\n",
 						event->tick, event->value1 ? "timeout" : "reconnected",
 						event->value2);
+					break;
+				case XBOXINPUT_LOG_TITLE_UI_GATE:
+					fprintf(file, "tick=%lu event=title_ui_gate action=%s executableTitle=%08X xamTitle=%08X module=%08X namePrefix=%08X\r\n",
+						event->tick,
+						event->value1 == 0 ? "allowed" :
+						(event->value1 == 1 ? "skipped_emulator" :
+						(event->value1 == 2 ? "skipped_unknown_context" :
+						(event->value1 == 3 ? "skipped_title" : "worker_started"))),
+						event->value2, event->value3, event->value4, event->value5);
 					break;
 				case XBOXINPUT_LOG_CONFIG_PATH:
 					fprintf(file, "tick=%lu event=config_path state=%s path=%s\r\n",
@@ -1081,6 +1350,12 @@ typedef usb_interface_descriptor* (*usb_interface_descriptor_func_t)(deviceHandl
 typedef int(*usb_add_device_complete_func_t)(deviceHandle* handle, int status_code);
 typedef int(*usb_get_device_speed_func_t)(deviceHandle* handle);
 typedef int(*usb_queue_async_transfer_func_t)(deviceHandle* handle, void* endpoint);
+// Ordinal 886 dispatches a four-argument KDPC-style routine and waits for that
+// routine to RETURN, not for the subsequently queued USB transfer to complete.
+typedef void (*xboxinput_usb_dpc_routine_t)(PVOID, PVOID, PVOID, PVOID);
+typedef NTSTATUS (*xboxinput_wait_usb_dpc_t)(xboxinput_usb_dpc_routine_t, PVOID,
+ DWORD, PVOID, PVOID);
+xboxinput_wait_usb_dpc_t KeCallAndWaitForDpcRoutinePtr = nullptr;
 typedef NTSTATUS(*usb_queue_close_endpoint_func_t)(deviceHandle* handle, void* endpoint);
 typedef NTSTATUS(*usb_remove_device_complete_func_t)(deviceHandle* handle);
 typedef NTSTATUS(*usb_close_default_endpoint_func_t)(deviceHandle* handle, DWORD* endpoint);
@@ -2319,17 +2594,39 @@ struct GipSessionSlot {
 	UsbTrb                  outTrb;
 	BYTE                    earlyPowerBuf[5];
 	BYTE                    readBuf[GIP_READ_BUF_SIZE];
-	BYTE                    outBuf[GIP_TX_BUFS][64];
-	BYTE                    rumbleBuf[64];
-	int                     outBufIndex;
 	bool                    outOpen;
-	volatile LONG           rumbleInFlight;
-	volatile LONG           rumblePending;
-	BYTE                    rumbleRequestedLeft;
-	BYTE                    rumbleRequestedRight;
-	BYTE                    rumbleLastLeft;
-	BYTE                    rumbleLastRight;
-	bool                    rumbleHaveLast;
+	DWORD                   outputLock;
+	XboxInputOutputQueue    output;
+	DWORD                   outputActiveTick;
+	DWORD                   outputSummaryTick;
+	DWORD                   outputLastCompleted;
+	bool                    outputStallLogged;
+	volatile LONG           outputCompletionPending;
+	volatile LONG           outputCompletionStatus;
+	// Diagnostic telemetry only. Never used to authorize or recover a transfer.
+	volatile LONG           outputTraceTransfer;
+	volatile LONG           outputTraceEntered;
+	volatile LONG           outputTraceReturned;
+	volatile LONG           outputTraceCallbacks;
+	volatile LONG           outputTraceConsumed;
+	volatile LONG           outputTraceInsideSubmit;
+	volatile LONG           outputTraceReturnTick;
+	volatile LONG           outputTraceToken;
+	volatile LONG           outputTraceWorkerTick;
+	volatile LONG           outputTraceCallbackTransfer;
+	volatile LONG           outputTraceCallbackTick;
+	volatile LONG           outputTraceCallbackStatus;
+	volatile LONG           outputTraceCallbackPreviousPending;
+	DWORD                   outputTraceWatchdogTick;
+	bool                    outputTraceWatchdogValid;
+	DWORD                   outputTraceStopTick;
+	bool                    outputTraceStopValid;
+	DWORD                   runtimeRumbleRequests;
+	DWORD                   runtimeRumbleNonzeroRequests;
+	DWORD                   runtimeRumbleSampleTick;
+	DWORD                   runtimeRumbleSampleRequests;
+	bool                    runtimeRumbleSampleValid;
+	XboxInputGipInputReadiness inputReadiness;
 	uint8_t                 sequence;
 	bool                    identifySent;
 	bool                    identifyReplySeen;
@@ -2370,21 +2667,21 @@ static GipSessionSlot* g_gipPrimarySession = &g_gipSessions[0];
 #define g_gipInputsSeen             (g_gipPrimarySession->inputsSeen)
 #define g_gipGuideOverlayOpen       (g_gipPrimarySession->guideOverlayOpen)
 #define g_gipOutTrb                 (g_gipPrimarySession->outTrb)
-#define g_gipOutBuf                 (g_gipPrimarySession->outBuf)
-#define g_gipOutBufIdx              (g_gipPrimarySession->outBufIndex)
+
+
 #define g_gipOutOpen                (g_gipPrimarySession->outOpen)
 #define g_gipEarlyPowerBuf          (g_gipPrimarySession->earlyPowerBuf)
 #define g_gipEarlyPowerBusy         (g_gipPrimarySession->earlyPowerBusy)
 #define g_gipEarlyPowerHandle       (g_gipPrimarySession->earlyPowerHandle)
 #define g_gipEarlyPowerPacketSize   (g_gipPrimarySession->earlyPowerPacketSize)
-#define g_gipRumbleBuf              (g_gipPrimarySession->rumbleBuf)
-#define g_gipRumbleInFlight         (g_gipPrimarySession->rumbleInFlight)
-#define g_gipRumblePending          (g_gipPrimarySession->rumblePending)
-#define g_gipRumbleRequestedLeft    (g_gipPrimarySession->rumbleRequestedLeft)
-#define g_gipRumbleRequestedRight   (g_gipPrimarySession->rumbleRequestedRight)
-#define g_gipRumbleLastLeft         (g_gipPrimarySession->rumbleLastLeft)
-#define g_gipRumbleLastRight        (g_gipPrimarySession->rumbleLastRight)
-#define g_gipRumbleHaveLast         (g_gipPrimarySession->rumbleHaveLast)
+
+
+
+
+
+
+
+
 #define g_gipSeq                    (g_gipPrimarySession->sequence)
 #define g_gipIdentifySent           (g_gipPrimarySession->identifySent)
 #define g_gipIdentifyReplySeen      (g_gipPrimarySession->identifyReplySeen)
@@ -2416,7 +2713,9 @@ static GipSessionSlot* GipReservePrimarySession(
 	GipSessionSlot* session = GipFindFreeSession();
 	if (!session || !profile || !handle)
 		return 0;
-	memset(session, 0, sizeof(*session));
+memset(session, 0, sizeof(*session));
+	session->output.Initialize();
+	__sync();
 	session->reserved = true;
 	session->primary = true;
 	session->sequence = 1;
@@ -2511,233 +2810,11 @@ static const XboxInputControllerProfile* GipControllerProfile(
 	return controller->session ? controller->session->runtime.profile : 0;
 }
 
-// Sequence is adapter-global and never zero - refs/xone/bus/protocol.c:335-337.
-static uint8_t GipNextSeq() {
-	uint8_t s = g_gipSeq++;
-	if (g_gipSeq == 0)
-		g_gipSeq = 1;
-	return s;
-}
-
 static bool IsSupportedGipGamepad(uint16_t vid, uint16_t pid) {
 	return XboxInputFindProfileById(vid, pid, 0) != 0;
 }
 
-static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor);
-
-// Completion callbacks execute in the USB stack.  Do not log or allocate here;
-// either release the single-flight gate or immediately submit the newest cached
-// state.  A new XAM caller that wins the gate first simply owns the next transfer.
-static int32_t GipGamepadRumbleComplete(DWORD trbAddr, int32_t status) {
-	// A retired session may complete after a reconnect. It owns different TRB
-	// storage and must never release the new session's single-flight gate.
-	if (trbAddr != (DWORD)&g_gipOutTrb)
-		return status;
-	InterlockedExchange(&g_gipRumbleInFlight, 0);
-	if (!g_gipOutOpen || !g_gipExt.deviceHandle)
-		return status;
-	if (InterlockedExchange(&g_gipRumblePending, 0) == 0)
-		return status;
-	if (InterlockedCompareExchange(&g_gipRumbleInFlight, 1, 0) != 0)
-		return status;
-	int queued = GipQueueGamepadRumble(g_gipExt.deviceHandle,
-		g_gipRumbleRequestedLeft, g_gipRumbleRequestedRight);
-	if (queued != 0)
-		InterlockedExchange(&g_gipRumbleInFlight, 0);
-	return status;
-}
-
-static int GipQueueGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor) {
-	if (!g_gipOutOpen || !h)
-		return -1;
-	BYTE payload[9];
-	XboxInputBuildGipRumblePayload(leftMotor, rightMotor, payload);
-	int i = 0;
-	g_gipRumbleBuf[i++] = GIP_CMD_RUMBLE;
-	g_gipRumbleBuf[i++] = 0x00;
-	g_gipRumbleBuf[i++] = GipNextSeq();
-	g_gipRumbleBuf[i++] = (BYTE)sizeof(payload);
-	memcpy(g_gipRumbleBuf + i, payload, sizeof(payload));
-	i += sizeof(payload);
-	g_gipOutTrb.buffer = g_gipRumbleBuf;
-	g_gipOutTrb.length = i;
-	g_gipOutTrb.flags = 1;
-	g_gipOutTrb.callback = (DWORD)GipGamepadRumbleComplete;
-	g_gipOutTrb.savedEndpoint = g_gipOutTrb.endpoint;
-	return UsbdQueueAsyncTransfer(h, &g_gipOutTrb);
-}
-
-//
-// Build and send one GIP packet on the interrupt OUT endpoint.
-// All packets we send have payloads well under 128 bytes, so the length varint is a
-// single byte and the header is 4 bytes (already even, no padding needed).
-//
-static int GipSendSeq(deviceHandle* h, uint8_t cmd, uint8_t options, uint8_t seq,
-                      const BYTE* payload, int payloadLen) {
-	if (!g_gipOutOpen || !h || payloadLen < 0 || payloadLen > 60)
-		return -1;
-
-	BYTE* buf = g_gipOutBuf[g_gipOutBufIdx];
-	g_gipOutBufIdx = (g_gipOutBufIdx + 1) % GIP_TX_BUFS;
-
-	int i = 0;
-	buf[i++] = cmd;
-	buf[i++] = options;
-	buf[i++] = seq;
-	buf[i++] = (BYTE)payloadLen;
-	if (payload && payloadLen > 0) {
-		memcpy(buf + i, payload, payloadLen);
-		i += payloadLen;
-	}
-
-	SendInterruptRequest(h, &g_gipOutTrb, buf, i, (DWORD)noopCompleteHandler);
-	return 0;
-}
-
-// Normal single packets allocate a fresh sequence.
-static int GipSend(deviceHandle* h, uint8_t cmd, uint8_t options,
-                   const BYTE* payload, int payloadLen) {
-	return GipSendSeq(h, cmd, options, GipNextSeq(), payload, payloadLen);
-}
-
-// Direct Motor Command is a normal GIP command with flags 0x00, an incrementing
-// sequence and a 9-byte payload. The second payload byte enables both grip
-// motors; the next two are the trigger motors, which have no 360 equivalent.
-static int GipSendGamepadRumble(deviceHandle* h, BYTE leftMotor, BYTE rightMotor) {
-	if (!h || !g_gipOutOpen)
-		return -1;
-	if (g_gipRumbleHaveLast && leftMotor == g_gipRumbleLastLeft &&
-		rightMotor == g_gipRumbleLastRight)
-		return 0;
-	g_gipRumbleHaveLast = true;
-	g_gipRumbleLastLeft = leftMotor;
-	g_gipRumbleLastRight = rightMotor;
-	g_gipRumbleRequestedLeft = leftMotor;
-	g_gipRumbleRequestedRight = rightMotor;
-	XboxInputQueueLogEvent(XBOXINPUT_LOG_RUMBLE,
-		0xFF, // primary slot is recorded by controller_ready; avoid hot-path lookup here
-		((DWORD)leftMotor << 8) | rightMotor);
-	if (InterlockedCompareExchange(&g_gipRumbleInFlight, 1, 0) != 0) {
-		InterlockedExchange(&g_gipRumblePending, 1);
-		return 0;
-	}
-	int queued = GipQueueGamepadRumble(h, leftMotor, rightMotor);
-	if (queued != 0)
-		InterlockedExchange(&g_gipRumbleInFlight, 0);
-	return queued;
-}
-
-// Session-local outbound path used by the multi-controller implementation.  It
-// intentionally has no shared sequence counter, transfer request or buffer.
-static uint8_t GipSessionNextSeq(GipSessionSlot* session) {
-	uint8_t seq = session->sequence++;
-	if (session->sequence == 0)
-		session->sequence = 1;
-	return seq;
-}
-
-static int GipSessionSend(GipSessionSlot* session, uint8_t cmd, uint8_t options,
-	const BYTE* payload, int payloadLen) {
-	if (!session || !session->outOpen || !session->ext.deviceHandle ||
-		payloadLen < 0 || payloadLen > 60)
-		return -1;
-	BYTE* buf = session->outBuf[session->outBufIndex];
-	session->outBufIndex = (session->outBufIndex + 1) % GIP_TX_BUFS;
-	int i = 0;
-	buf[i++] = cmd;
-	buf[i++] = options;
-	buf[i++] = GipSessionNextSeq(session);
-	buf[i++] = (BYTE)payloadLen;
-	if (payload && payloadLen) {
-		memcpy(buf + i, payload, payloadLen);
-		i += payloadLen;
-	}
-	SendInterruptRequest(session->ext.deviceHandle, &session->outTrb, buf, i,
-		(DWORD)noopCompleteHandler);
-	return 0;
-}
-
-static int GipSessionSendSeq(GipSessionSlot* session, uint8_t cmd, uint8_t options,
-	uint8_t seq, const BYTE* payload, int payloadLen) {
-	if (!session || !session->outOpen || !session->ext.deviceHandle ||
-		payloadLen < 0 || payloadLen > 60)
-		return -1;
-	BYTE* buf = session->outBuf[session->outBufIndex];
-	session->outBufIndex = (session->outBufIndex + 1) % GIP_TX_BUFS;
-	int i = 0;
-	buf[i++] = cmd; buf[i++] = options; buf[i++] = seq; buf[i++] = (BYTE)payloadLen;
-	if (payload && payloadLen) { memcpy(buf + i, payload, payloadLen); i += payloadLen; }
-	SendInterruptRequest(session->ext.deviceHandle, &session->outTrb, buf, i,
-		(DWORD)noopCompleteHandler);
-	return 0;
-}
-
-static int GipSessionQueueRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor);
-
-static int32_t GipSessionRumbleComplete(DWORD trbAddr, int32_t status) {
-	GipSessionSlot* session = 0;
-	for (int i = 0; i < GIP_MAX_SESSIONS; ++i) {
-		if ((DWORD)&g_gipSessions[i].outTrb == trbAddr) {
-			session = &g_gipSessions[i];
-			break;
-		}
-	}
-	if (!session)
-		return status;
-	InterlockedExchange(&session->rumbleInFlight, 0);
-	if (!session->reserved || !session->outOpen || !session->ext.deviceHandle)
-		return status;
-	if (InterlockedExchange(&session->rumblePending, 0) == 0)
-		return status;
-	if (InterlockedCompareExchange(&session->rumbleInFlight, 1, 0) != 0)
-		return status;
-	int queued = GipSessionQueueRumble(session,
-		session->rumbleRequestedLeft, session->rumbleRequestedRight);
-	if (queued != 0)
-		InterlockedExchange(&session->rumbleInFlight, 0);
-	return status;
-}
-
-static int GipSessionQueueRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
-	if (!session || !session->outOpen || !session->ext.deviceHandle)
-		return -1;
-	BYTE payload[9];
-	XboxInputBuildGipRumblePayload(leftMotor, rightMotor, payload);
-	int i = 0;
-	session->rumbleBuf[i++] = GIP_CMD_RUMBLE;
-	session->rumbleBuf[i++] = 0x00;
-	session->rumbleBuf[i++] = GipSessionNextSeq(session);
-	session->rumbleBuf[i++] = (BYTE)sizeof(payload);
-	memcpy(session->rumbleBuf + i, payload, sizeof(payload));
-	i += sizeof(payload);
-	session->outTrb.buffer = session->rumbleBuf;
-	session->outTrb.length = i;
-	session->outTrb.flags = 1;
-	session->outTrb.callback = (DWORD)GipSessionRumbleComplete;
-	session->outTrb.savedEndpoint = session->outTrb.endpoint;
-	return UsbdQueueAsyncTransfer(session->ext.deviceHandle, &session->outTrb);
-}
-
-static int GipSessionSendRumble(GipSessionSlot* session, BYTE leftMotor, BYTE rightMotor) {
-	if (!session || !session->outOpen || !session->ext.deviceHandle)
-		return -1;
-	if (session->rumbleHaveLast && leftMotor == session->rumbleLastLeft &&
-		rightMotor == session->rumbleLastRight)
-		return 0;
-	session->rumbleHaveLast = true;
-	session->rumbleLastLeft = leftMotor;
-	session->rumbleLastRight = rightMotor;
-	session->rumbleRequestedLeft = leftMotor;
-	session->rumbleRequestedRight = rightMotor;
-	if (InterlockedCompareExchange(&session->rumbleInFlight, 1, 0) != 0) {
-		InterlockedExchange(&session->rumblePending, 1);
-		return 0;
-	}
-	int queued = GipSessionQueueRumble(session, leftMotor, rightMotor);
-	if (queued != 0)
-		InterlockedExchange(&session->rumbleInFlight, 0);
-	return queued;
-}
+#include "gip_output_transport.inl"
 
 static void GipRegisterWithXam();
 static int GipStartPostIdentifyStartup(GipSessionSlot* session);
@@ -2770,6 +2847,7 @@ static int32_t GipPowerAInitComplete(DWORD trbAddr, int32_t status) {
 
 	if (completed == POWERA_INIT_RUMBLE_STOP) {
 		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_COMPLETE);
+		GipEstablishStoppedRumble(g_gipPrimarySession);
 		if (!XboxInputRuntimeIsReady(&g_gipRuntime)) {
 			XboxInputRuntimeSetReady(&g_gipRuntime, true);
 			g_gipClaimAttempts = 0;
@@ -2817,19 +2895,11 @@ static int GipPowerAQueueStage(LONG stage) {
 		return -1;
 	}
 
-	int length = 0;
-	g_powerAInitBuf[length++] = command;
-	g_powerAInitBuf[length++] = options;
-	g_powerAInitBuf[length++] = GipNextSeq();
-	g_powerAInitBuf[length++] = (BYTE)payloadLen;
-	memcpy(g_powerAInitBuf + length, payload, payloadLen);
-	length += payloadLen;
 	InterlockedExchange(&g_powerAInitStage, stage);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 		XBOXINPUT_USB_POWERA_STAGE + stage, 0x80000000 | (DWORD)command);
-	SendInterruptRequest(g_gipExt.deviceHandle, &g_gipOutTrb,
-		g_powerAInitBuf, length, (DWORD)GipPowerAInitComplete);
-	return 0;
+	return GipEnqueueCommand(g_gipPrimarySession, command, options,
+		payload, payloadLen, (DWORD)GipPowerAInitComplete);
 }
 
 //
@@ -3140,7 +3210,8 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 				// IDENTIFY. A valid parsed report on our claimed, supported interface
 				// is enough to restore the XAM slot; otherwise input is lost at user 255.
 				if (!XboxInputRuntimeIsReady(&g_gipRuntime) && g_gipExt.deviceHandle &&
-					IsSupportedGipGamepad(g_gipVendorId, g_gipProductId)) {
+					IsSupportedGipGamepad(g_gipVendorId, g_gipProductId) &&
+					GipSessionCanRegisterFromInput(g_gipPrimarySession)) {
 					XboxInputRuntimeSetReady(&g_gipRuntime, true);
 					g_gipPoweredOn = true;
 					g_gipClaimAttempts = 0;
@@ -3245,7 +3316,8 @@ static void GipSessionHandleTransfer(GipSessionSlot* session, const BYTE* data, 
 			if (GipParseGamepadInput(payload, (int)hdr.packetLength,
 				&session->runtime.state)) {
 				if (!XboxInputRuntimeIsReady(&session->runtime) &&
-					session->ext.deviceHandle) {
+					session->ext.deviceHandle &&
+					GipSessionCanRegisterFromInput(session)) {
 					session->poweredOn = true;
 					XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 						XBOXINPUT_USB_RESUMED_FROM_INPUT, hdr.sequence);
@@ -3288,7 +3360,8 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	// Bail out before touching anything if the device is already gone. This callback
 	// can still fire once after teardown with a completion that was already in flight;
 	// parsing or re-arming at that point is a use-after-free.
-	if (!ext || !ext->deviceHandle ||
+	if (!ext || !ext->deviceHandle || g_gipReadLoopStopped ||
+		g_gipRuntime.stopping ||
 		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return 0;
 	const XboxInputControllerProfile* completionProfile = g_gipRuntime.profile;
@@ -3363,10 +3436,10 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	else if (++g_gipReadErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 			XBOXINPUT_USB_READ_LOOP_STOPPED, status);
-		// Stop permanently. Nulling the handle is what every other path already
-		// treats as "this device is finished", so teardown stays unchanged.
-		ext->deviceHandle = 0;
+		// Preserve the handle identity for the removal hook. Losing it here
+		// would bypass our permanent-session retirement policy.
 		g_gipReadLoopStopped = true;
+		GipStopOutput(g_gipPrimarySession);
 		// Report HERE, not from the removal hook. fix1 put the confirmation print in
 		// UsbdRemoveDeviceCompleteHook, which never ran, so a silent log could not be
 		// told apart from a guard that never fired. One line, once per boot.
@@ -3398,20 +3471,17 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 	ext->interruptTrb.buffer = g_gipReadBuf;
 	ext->interruptTrb.callback = (DWORD)GipInterruptComplete;
 
-	// A failed re-arm is the same hazard by another route: if the queue itself starts
-	// rejecting, the caller may keep driving us. Stop on the same budget.
+	// The return is an opaque token; only a completion can report failure.
 	if (readBeforeInit)
 		InterlockedExchange(&g_gipPrimarySession->readBeforeInitPending, 1);
 	int32_t queued = UsbdQueueAsyncTransfer(ext->deviceHandle, &ext->interruptTrb);
-	if (queued != 0 && ++g_gipReadErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
-		ext->deviceHandle = 0;
-		g_gipReadLoopStopped = true;
-	}
+
 	return queued;
 }
 
 static int32_t GipStartPrimaryRead(HidControllerExtension* ext, uint16_t packetSize) {
-	if (!ext || !ext->deviceHandle ||
+	if (!ext || !ext->deviceHandle || g_gipReadLoopStopped ||
+		g_gipRuntime.stopping ||
 		GipSessionFromExtension(ext) != g_gipPrimarySession)
 		return -1;
 #ifdef XBOXINPUT_NO_READ
@@ -3519,18 +3589,12 @@ static int GipQueuePreReadInit(GipSessionSlot* session, LONG stage) {
 		return -1;
 	}
 
-	int length = 0;
-	session->preReadInitBuf[length++] = command;
-	session->preReadInitBuf[length++] = options;
-	session->preReadInitBuf[length++] = GipSessionNextSeq(session);
-	session->preReadInitBuf[length++] = (BYTE)payloadLength;
-	memcpy(session->preReadInitBuf + length, payload, payloadLength);
-	length += payloadLength;
+	if (stage == GIP_PRE_READ_INIT_POWER)
+		GipBeginStartup(session);
 	InterlockedExchange(&session->preReadInitStage, stage);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, queuedStep, command);
-	SendInterruptRequest(session->ext.deviceHandle, &session->outTrb,
-		session->preReadInitBuf, length, (DWORD)GipPreReadInitComplete);
-	return 0;
+	return GipEnqueueCommand(session, command, options, payload,
+		payloadLength, (DWORD)GipPreReadInitComplete);
 }
 
 static int32_t GipPreReadInitComplete(DWORD trbAddr, int32_t status) {
@@ -3541,7 +3605,8 @@ static int32_t GipPreReadInitComplete(DWORD trbAddr, int32_t status) {
 			break;
 		}
 	}
-	if (!session || !session->reserved || !session->ext.deviceHandle)
+	if (!session || !session->reserved || !session->ext.deviceHandle ||
+		session->runtime.stopping || !session->outOpen)
 		return status;
 
 	LONG completed = InterlockedCompareExchange(&session->preReadInitStage, 0, 0);
@@ -3568,12 +3633,18 @@ static int32_t GipPreReadInitComplete(DWORD trbAddr, int32_t status) {
 	if (completed != GIP_PRE_READ_INIT_AUTH_DONE &&
 		completed != GIP_PRE_READ_INIT_RUMBLE_SETUP)
 		return status;
+	if (completed == GIP_PRE_READ_INIT_RUMBLE_SETUP) {
+		// The startup sequence just established a stopped motor state. Suppress
+		// XAM's redundant first 0/0 SetState call instead of sending the same
+		// command again immediately after registration.
+		GipEstablishStoppedRumble(session);
+	}
 
 	InterlockedExchange(&session->preReadInitStage, GIP_PRE_READ_INIT_COMPLETE);
 	if (profile && session->identifyReplySeen && session->poweredOn &&
 		(profile->quirks & XBOXINPUT_QUIRK_RUMBLE_SETUP) != 0) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
-			XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE, status);
+		XBOXINPUT_USB_POST_IDENTIFY_STARTUP_COMPLETE, status);
 		if (!XboxInputRuntimeIsReady(&session->runtime)) {
 			if (session->primary) {
 				XboxInputRuntimeSetReady(&session->runtime, true);
@@ -3641,12 +3712,8 @@ static int32_t GipDisableAudioInterfaceComplete(DWORD trbAddr, int32_t status) {
 			return status;
 		session->earlyPowerHandle = ext->deviceHandle;
 		session->earlyPowerPacketSize = profile->endpointIdentity.maximumPacketSize;
-		session->outTrb.buffer = session->earlyPowerBuf;
-		session->outTrb.length = sizeof(session->earlyPowerBuf);
-		session->outTrb.flags = 1;
-		session->outTrb.callback = (DWORD)GipEarlyPowerComplete;
-		session->outTrb.savedEndpoint = session->outTrb.endpoint;
-		int32_t token = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+		int32_t token = GipEnqueueRaw(session, session->earlyPowerBuf,
+			sizeof(session->earlyPowerBuf), (DWORD)GipEarlyPowerComplete);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 			XBOXINPUT_USB_EARLY_POWER_QUEUED, token);
 		return status;
@@ -3654,12 +3721,8 @@ static int32_t GipDisableAudioInterfaceComplete(DWORD trbAddr, int32_t status) {
 
 	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
 	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
-	session->outTrb.buffer = session->earlyPowerBuf;
-	session->outTrb.length = sizeof(session->earlyPowerBuf);
-	session->outTrb.flags = 1;
-	session->outTrb.callback = (DWORD)GipSessionEarlyPowerComplete;
-	session->outTrb.savedEndpoint = session->outTrb.endpoint;
-	int32_t token = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+	int32_t token = GipEnqueueRaw(session, session->earlyPowerBuf,
+		sizeof(session->earlyPowerBuf), (DWORD)GipSessionEarlyPowerComplete);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 		XBOXINPUT_USB_EARLY_POWER_QUEUED, token);
 	return status;
@@ -3764,12 +3827,8 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		InterlockedCompareExchange(&g_gipEarlyPowerBusy, 1, 0) == 0) {
 		g_gipEarlyPowerHandle = ext->deviceHandle;
 		g_gipEarlyPowerPacketSize = pkt;
-		g_gipOutTrb.buffer = g_gipEarlyPowerBuf;
-		g_gipOutTrb.length = sizeof(g_gipEarlyPowerBuf);
-		g_gipOutTrb.flags = 1;
-		g_gipOutTrb.callback = (DWORD)GipEarlyPowerComplete;
-		g_gipOutTrb.savedEndpoint = g_gipOutTrb.endpoint;
-		int32_t queueToken = UsbdQueueAsyncTransfer(ext->deviceHandle, &g_gipOutTrb);
+		int32_t queueToken = GipEnqueueRaw(g_gipPrimarySession, g_gipEarlyPowerBuf,
+			sizeof(g_gipEarlyPowerBuf), (DWORD)GipEarlyPowerComplete);
 		// This API returns an opaque transfer token (009B121D on the tested
 		// console), NOT a zero/nonzero status. Only the completion callback says
 		// whether POWER succeeded; it alone may start the first IN read.
@@ -3786,7 +3845,8 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 4);
 	GipSessionSlot* session = GipSessionFromExtension(ext);
-	if (!session || !session->reserved || !ext || !ext->deviceHandle)
+	if (!session || !session->reserved || !ext || !ext->deviceHandle ||
+		session->readLoopStopped || session->runtime.stopping)
 		return 0;
 	const XboxInputControllerProfile* completionProfile = session->runtime.profile;
 	const bool readBeforeInit = completionProfile &&
@@ -3822,8 +3882,8 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 	else if (++session->readErrors >= GIP_MAX_CONSECUTIVE_READ_ERRORS) {
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 			XBOXINPUT_USB_READ_LOOP_STOPPED, status);
-		ext->deviceHandle = 0;
 		session->readLoopStopped = true;
+		GipStopOutput(session);
 		return status;
 	}
 	if (!ext->deviceHandle)
@@ -3839,7 +3899,8 @@ static int32_t GipSessionInterruptComplete(DWORD trbAddr, int32_t status) {
 }
 
 static int32_t GipSessionStartRead(GipSessionSlot* session) {
-	if (!session || !session->reserved || !session->ext.deviceHandle)
+	if (!session || !session->reserved || !session->ext.deviceHandle ||
+		session->readLoopStopped || session->runtime.stopping)
 		return -1;
 	HidControllerExtension* ext = &session->ext;
 	memset(session->readBuf, 0, sizeof(session->readBuf));
@@ -3916,12 +3977,8 @@ static int32_t GipSessionSetConfigComplete(DWORD trbAddr, int32_t status) {
 		return readBeforeInit ? 0 : GipSessionStartRead(session);
 	const BYTE powerOn[5] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0, 1, 0 };
 	memcpy(session->earlyPowerBuf, powerOn, sizeof(powerOn));
-	session->outTrb.buffer = session->earlyPowerBuf;
-	session->outTrb.length = sizeof(session->earlyPowerBuf);
-	session->outTrb.flags = 1;
-	session->outTrb.callback = (DWORD)GipSessionEarlyPowerComplete;
-	session->outTrb.savedEndpoint = session->outTrb.endpoint;
-	int32_t queueToken = UsbdQueueAsyncTransfer(ext->deviceHandle, &session->outTrb);
+	int32_t queueToken = GipEnqueueRaw(session, session->earlyPowerBuf,
+		sizeof(session->earlyPowerBuf), (DWORD)GipSessionEarlyPowerComplete);
 	XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP,
 		XBOXINPUT_USB_EARLY_POWER_QUEUED, queueToken);
 	return 0; // The callback starts the read unless the profile armed it first.
@@ -3932,7 +3989,9 @@ static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
 	GipSessionSlot* session = GipFindFreeSession();
 	if (!session || !profile)
 		return -1;
-	memset(session, 0, sizeof(*session));
+memset(session, 0, sizeof(*session));
+	session->output.Initialize();
+	__sync();
 	session->reserved = true;
 	XboxInputInitializeRuntime(&session->runtime, profile);
 	session->runtime.lifecycle = XBOXINPUT_SESSION_INITIALIZING;
@@ -3948,7 +4007,9 @@ static int GipClaimAdditionalSession(deviceHandle* h, BYTE interfaceNumber,
 	NTSTATUS openStatus = UsbdOpenDefaultEndpoint(h, (DWORD*)&session->ext.controlTrb);
 	if (NT_ERROR(openStatus)) {
 		session->ext.deviceHandle = 0;
-		session->reserved = false;
+		// A published session is never reset beneath the output dispatcher,
+		// even when opening its default endpoint fails.
+		GipStopOutput(session);
 		return result;
 	}
 	SendControlRequest(h, &session->ext.controlTrb,
@@ -4311,8 +4372,11 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			XboxInputQueueLogEvent(XBOXINPUT_LOG_USB_STEP, XBOXINPUT_USB_REMOVE_BEGIN,
 				removedUser);
 			XboxInputRuntimeSetReady(&session->runtime, false);
+			session->runtime.stopping = true;
 			session->runtime.guidePending = false;
 			session->outOpen = false;
+			GipStopOutput(session);
+			__sync();
 			session->ext.deviceHandle = 0;
 			session->ext.cleanupDone = 1;
 			h->driver = 0;
@@ -4350,7 +4414,13 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 			g_gipRuntime.playerIndex);
 		XBOXINPUT_DBG("XBOXINPUT: *** device removed - tearing down GIP state ***\r\n");
 
-		// Stop presenting as a live controller before releasing USB state.
+		// Stop presenting as a live controller before releasing USB state or
+		// allowing the passive rumble worker to observe this session again.
+		XboxInputRuntimeSetReady(&g_gipRuntime, false);
+		g_gipRuntime.stopping = true;
+		g_gipOutOpen = false;
+		GipStopOutput(g_gipPrimarySession);
+		__sync();
 
 		// 1. Stop the re-arm loop and the send path. Null the handle before anything
 		//    else so a completion that fires mid-teardown cannot re-arm.
@@ -4361,7 +4431,6 @@ NTSTATUS UsbdRemoveDeviceCompleteHook(deviceHandle* h) {
 		g_gipProductId = 0;
 		InterlockedExchange(&g_powerAInitStage, POWERA_INIT_IDLE);
 		InterlockedExchange(&g_powerAIdentifyComplete, 0);
-		g_gipOutOpen = false;
 
 		// 2. Do NOT close the endpoints here.
 		//
@@ -4647,9 +4716,7 @@ static void GipControllerSendRumble(const GipControllerRef* controller,
 	const XboxInputControllerProfile* profile = GipControllerProfile(controller);
 	if (!profile || !(profile->capabilities & XBOXINPUT_CAP_RUMBLE))
 		return;
-	if (controller->kind == GIP_CONTROLLER_PRIMARY)
-		GipSendGamepadRumble(g_gipExt.deviceHandle, left, right);
-	else if (controller->kind == GIP_CONTROLLER_ADDITIONAL && controller->session)
+	if (controller->session)
 		GipSessionSendRumble(controller->session, left, right);
 }
 
@@ -4690,8 +4757,7 @@ static NTSTATUS GipControllerReadState(const GipControllerRef* controller,
 }
 
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
-	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, vibration);
-
+	const DWORD originalUser = user;
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
 	GipControllerRef controller;
@@ -4706,6 +4772,9 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration)
 		GipControllerSendRumble(&controller, left, right);
 		return ERROR_SUCCESS;
 	}
+
+	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(
+		originalUser, flags, vibration);
 
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
@@ -4819,6 +4888,31 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 	return status;
 }
 
+// Deliberately API-free: known XeFu and unknown/transitional module names must
+// return before process/title/header queries, logging or thread creation.
+// This is a sampled exclusion, not a loader lock or an atomic title handover.
+static bool XboxInputReadTitleUiModuleName(PLDR_DATA_TABLE_ENTRY* moduleOut,
+	DWORD* namePrefixOut) {
+	PLDR_DATA_TABLE_ENTRY module = g_xboxInputExecutableModule
+		? *g_xboxInputExecutableModule : nullptr;
+	if (!module || !module->BaseDllName.Buffer || module->BaseDllName.Length == 0 ||
+		module->BaseDllName.Length > 512 || (module->BaseDllName.Length & 1) != 0)
+		return false;
+	const WCHAR* name = module->BaseDllName.Buffer;
+	const unsigned int count = module->BaseDllName.Length / sizeof(WCHAR);
+	if (!XboxInputTitleUiNativeModuleNameAllowed(name, count))
+		return false;
+	if (moduleOut)
+		*moduleOut = module;
+	if (namePrefixOut) {
+		DWORD prefix = 0;
+		for (unsigned int i = 0; i < count && i < 4; ++i)
+			prefix = (prefix << 8) | (name[i] & 0xFF);
+		*namePrefixOut = prefix;
+	}
+	return true;
+}
+
 static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 	DWORD workerTitle = (DWORD)(ULONG_PTR)parameter;
 	typedef DWORD(*xam_get_current_title_id_t)(void);
@@ -4827,26 +4921,13 @@ static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 	DWORD notificationStarted = 0;
 	LONG pendingRemoved = 0;
 	BOOL savedShow = TRUE, savedMovie = TRUE, savedSound = TRUE, savedIptv = TRUE;
-	DWORD lastMappingReloadCheck = 0;
 	for (;;) {
-		if (!XamGetCurrentTitleIdPtr ||
+		if (!XboxInputReadTitleUiModuleName(nullptr, nullptr) ||
+			!XamGetCurrentTitleIdPtr ||
 			((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)() != workerTitle)
 			break;
 
-		const DWORD now = GetTickCount();
-		if ((DWORD)(now - lastMappingReloadCheck) >= 500) {
-			lastMappingReloadCheck = now;
-			FILE* request = fopen(XBOXINPUT_RELOAD_PATH, "r");
-			if (request) {
-				fclose(request);
-				XboxInputMappingOptions reloaded;
-				if (XboxInputLoadGamepadMapping(XBOXINPUT_CFG_PATH, &reloaded)) {
-					XboxInputPublishMapping(&reloaded);
-					XBOXINPUT_LOG("XBOXINPUT: mapping reloaded on request\r\n");
-				}
-				remove(XBOXINPUT_RELOAD_PATH);
-			}
-		}
+		// Test31 retains Test30's disabled config-file polling.
 
 		pendingRemoved |= InterlockedExchange(&g_xboxInputRemovedUiMask, 0);
 		if (pendingRemoved && !notificationActive && g_xboxInputDisconnectedUiMask != 0) {
@@ -4891,24 +4972,72 @@ static DWORD XboxInputTitleUiWorker(PVOID parameter) {
 		}
 		Sleep(50);
 	}
-	if (notificationActive) {
+	if (notificationActive && XboxInputReadTitleUiModuleName(nullptr, nullptr)) {
 		XNotifyQueueUI(XNOTIFYUI_TYPE_CANCELPERSISTENT, XUSER_INDEX_ANY,
 			XNOTIFYUI_PRIORITY_PERSISTENT, 0, 0);
-		const DWORD elapsed = (DWORD)(GetTickCount() - notificationStarted);
-		if (elapsed < 9000)
-			Sleep(9000 - elapsed);
-		XNotifyUISetOptions(savedShow, savedMovie, savedSound, savedIptv);
+		// Preserve the nine-second animation allowance in native titles, but
+		// recheck after every short sleep instead of waking in XeFu to call XAM.
+		while (XboxInputReadTitleUiModuleName(nullptr, nullptr)) {
+			const DWORD elapsed = (DWORD)(GetTickCount() - notificationStarted);
+			const DWORD delay = XboxInputTitleUiCleanupDelay(elapsed);
+			if (delay == 0) {
+				XNotifyUISetOptions(savedShow, savedMovie, savedSound, savedIptv);
+				break;
+			}
+			Sleep(delay);
+		}
 	}
 	if ((DWORD)g_xboxInputUiWorkerTitle == workerTitle)
 		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
 	return 0;
 }
 
+static void XboxInputLogUiGate(DWORD phase, DWORD executableTitle, DWORD xamTitle,
+	DWORD module, DWORD namePrefix) {
+	LONG oldModule = InterlockedExchange(&g_xboxInputUiGateModule, (LONG)module);
+	LONG oldPhase = InterlockedExchange(&g_xboxInputUiGatePhase, (LONG)phase);
+	if ((DWORD)oldModule != module || (DWORD)oldPhase != phase)
+		XboxInputQueueLogEventEx(XBOXINPUT_LOG_TITLE_UI_GATE, phase,
+			executableTitle, xamTitle, module, namePrefix);
+}
+
 static void XboxInputEnsureTitleUiWorker() {
+	PLDR_DATA_TABLE_ENTRY module = nullptr;
+	DWORD namePrefix = 0;
+	if (!XboxInputReadTitleUiModuleName(&module, &namePrefix))
+		return;
 	if (!XamGetCurrentTitleIdPtr || KeGetCurrentProcessType() != PROC_USER)
 		return;
+	// Only a recognised non-emulator name reaches process/header/title helpers.
+	DWORD moduleAddress = (DWORD)(ULONG_PTR)module;
+	DWORD executableTitle = 0;
+	bool metadataAvailable = false, emulatorName = false;
+	if (module->XexHeaderBase && g_xboxInputHeaderField) {
+		PXEX_EXECUTION_ID id = (PXEX_EXECUTION_ID)g_xboxInputHeaderField(
+			module->XexHeaderBase, XEX_HEADER_EXECUTION_ID);
+		if (id) {
+			executableTitle = id->TitleID;
+			metadataAvailable = true;
+		}
+	}
+	if (!XboxInputTitleUiModuleAllowed(metadataAvailable, emulatorName, executableTitle)) {
+		XboxInputLogUiGate(emulatorName || executableTitle == 0xFFFE07D2u ? 1 : 2,
+			executableTitle, 0, moduleAddress, namePrefix);
+		return;
+	}
 	typedef DWORD(*xam_get_current_title_id_t)(void);
 	DWORD title = ((xam_get_current_title_id_t)XamGetCurrentTitleIdPtr)();
+	typedef BOOL(*xam_is_xbox1_title_id_t)(DWORD);
+	const bool classifierAvailable = g_xboxInputIsXbox1TitleId != nullptr;
+	const bool xbox1Title = classifierAvailable &&
+		((xam_is_xbox1_title_id_t)g_xboxInputIsXbox1TitleId)(title) != FALSE;
+	// XeFu cannot safely run our title-owned notification/config worker.
+	// Leave input and rumble active; gate before worker state or CreateThread.
+	if (!XboxInputTitleUiWorkerAllowed(title, classifierAvailable, xbox1Title)) {
+		XboxInputLogUiGate(3, executableTitle, title, moduleAddress, namePrefix);
+		return;
+	}
+	XboxInputLogUiGate(0, executableTitle, title, moduleAddress, namePrefix);
 	if ((DWORD)g_xboxInputUiWorkerTitle != title) {
 		InterlockedExchange(&g_xboxInputUiWorkerTitle, (LONG)title);
 		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
@@ -4918,8 +5047,11 @@ static void XboxInputEnsureTitleUiWorker() {
 	HANDLE thread = CreateThread(0, 0,
 		(LPTHREAD_START_ROUTINE)XboxInputTitleUiWorker,
 		(PVOID)(ULONG_PTR)title, 0, 0);
-	if (thread)
+	if (thread) {
+		XboxInputQueueLogEventEx(XBOXINPUT_LOG_TITLE_UI_GATE, 4,
+			executableTitle, title, moduleAddress, namePrefix);
 		CloseHandle(thread);
+	}
 	else
 		InterlockedExchange(&g_xboxInputUiWorkerRunning, 0);
 }
@@ -5071,11 +5203,17 @@ bool initFunctionPointers() {
 	XexGetProcedureAddress(kernelHandle, 747, &UsbdOpenEndpoint);
 	XexGetProcedureAddress(kernelHandle, 742, &UsbdGetDeviceSpeed);
 	XexGetProcedureAddress(kernelHandle, 748, &UsbdQueueAsyncTransfer);
+#if XBOXINPUT_USB_DPC_SUBMIT
+	XexGetProcedureAddress(kernelHandle, 886, &KeCallAndWaitForDpcRoutinePtr);
+#endif
 	XexGetProcedureAddress(kernelHandle, 750, &UsbdQueueCloseEndpoint);
 	XexGetProcedureAddress(kernelHandle, 749, &UsbdQueueCloseDefaultEndpoint);
 	XexGetProcedureAddress(kernelHandle, 751, &UsbdRemoveDeviceComplete);
 	XexGetProcedureAddress(kernelHandle, 189, &MmFreePhysicalMemory);
 	XexGetProcedureAddress(kernelHandle, 486, &XInputdReadStatePtr);
+	// Optional exports used only to guard the title-owned UI/config worker.
+	XexGetProcedureAddress(kernelHandle, 403, (PVOID*)&g_xboxInputExecutableModule);
+	XexGetProcedureAddress(kernelHandle, 299, (PVOID*)&g_xboxInputHeaderField);
 
 	// Ordinals cross-checked against Xenia's export table
 	// (refs/xenia/src/xenia/kernel/xam/xam_table.inc:197-199, 481).
@@ -5091,6 +5229,9 @@ bool initFunctionPointers() {
 	// refs/xenia/src/xenia/kernel/xam/xam_info.cc:225.
 	// Optional: used by the title-owned disconnect notification worker.
 	XexGetProcedureAddress(xamHandle, 463, &XamGetCurrentTitleIdPtr);
+	XexGetProcedureAddress(xamHandle, 447, &g_xboxInputIsXbox1TitleId);
+	XBOXINPUT_LOG("XBOXINPUT: XamIsXbox1TitleId (447) %s; missing disables optional title UI only\r\n",
+		g_xboxInputIsXbox1TitleId ? "resolved" : "DID NOT RESOLVE");
 	XBOXINPUT_LOG("XBOXINPUT: XamGetCurrentTitleId (463) %s\r\n",
 		XamGetCurrentTitleIdPtr ? "resolved" : "DID NOT RESOLVE");
 
@@ -5103,6 +5244,9 @@ bool initFunctionPointers() {
 	if (!UsbdOpenDefaultEndpoint)       missing |= 0x00000008;
 	if (!UsbdOpenEndpoint)              missing |= 0x00000010;
 	if (!UsbdQueueAsyncTransfer)        missing |= 0x00000020;
+#if XBOXINPUT_USB_DPC_SUBMIT
+	if (!KeCallAndWaitForDpcRoutinePtr) missing |= 0x00010000;
+#endif
 	if (!UsbdQueueCloseEndpoint)        missing |= 0x00000040;
 	if (!UsbdQueueCloseDefaultEndpoint) missing |= 0x00000080;
 	if (!UsbdRemoveDeviceComplete)      missing |= 0x00000100;
@@ -5366,6 +5510,13 @@ static DWORD XboxInputInitializeThread(PVOID) {
 		// This is also where the GIP claim lives (UsbdAddDeviceComplete), so below
 		// level 7 the dongle is left unclaimed exactly as a no-plugin boot leaves it.
 #if XBOXINPUT_BUILD_LEVEL >= XBOXINPUT_LEVEL_FULL
+		HANDLE outputThread = MakeThread((LPTHREAD_START_ROUTINE)GipOutputWorker, nullptr);
+		if (!outputThread) {
+			XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP,
+				XBOXINPUT_INIT_ABORT_FUNCTIONS, 0x00010000);
+			return TRUE;
+		}
+		CloseHandle(outputThread);
 		InstallUsbProbes();
 		XboxInputSetDiagStage(10);
 		XboxInputQueueLogEvent(XBOXINPUT_LOG_INIT_STEP, XBOXINPUT_INIT_USB_HOOKS_READY, 0);
