@@ -13,9 +13,6 @@ Controllers compatible with this includes Xbox One, One S, Elite, Elite Series
 
 Full Xbox 360 Controller functionality with rumble.
 
-Have a third-party Xbox One/Series Controller and want it supported? Please read the guide and make an issue using the template!
-[Third-party Support Guide](https://github.com/bloxmaster0811/XboxInput/blob/main/THIRD_PARTY_CONTROLLER_SUPPORT.md)
-
 Multiple controllers up to 4 connected are supported! Please report any problems to the issues page!
 
 ## Installation
