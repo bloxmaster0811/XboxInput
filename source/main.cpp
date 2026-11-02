@@ -2517,7 +2517,15 @@ const uint16_t POWERA_VENDOR_ID = 0x24C6;
 const uint16_t POWERA_1414134_PID = 0x543A;
 
 static bool IsPowerA1414134(uint16_t vid, uint16_t pid) {
-	return vid == POWERA_VENDOR_ID && pid == POWERA_1414134_PID;
+	if (vid == POWERA_VENDOR_ID && pid == POWERA_1414134_PID)
+		return true;
+	// Electric Volt 2.4G wireless dongle (2C16:A2B3): speaks standard GIP
+	// on if0 (proven by usbmon capture - same 0x20 input layout as a wired
+	// One pad), but needs the same host-initiated early-POWER sequence.
+	// Without any host GIP traffic it reboots its USB side ~5s after
+	// enumeration (observed on libxenon bare-metal, re-enumerates as
+	// 11C1:5600); verified working on hardware with this path + rumble.
+	return vid == 0x2C16 && pid == 0xA2B3;
 }
 
 static const char* XboxInputKnownControllerName(uint16_t vid, uint16_t pid) {
