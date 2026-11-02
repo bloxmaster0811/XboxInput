@@ -56,6 +56,18 @@ static const XboxInputControllerProfile kControllerProfiles[] = {
 		{ 0x82, 0x02, 0x03, 4, 64 }
 	},
 	{
+		0x2C16, 0xA2B3, 0x0000, 0xFFFF,
+		"Electric Volt 2.4G wireless dongle",
+		XBOXINPUT_TRANSPORT_GIP_WIRED,
+		XBOXINPUT_PARSER_GIP_STANDARD,
+		XBOXINPUT_INIT_GIP_STANDARD,
+		kStandardGamepadCapabilities,
+		XBOXINPUT_QUIRK_GUIDE_SEPARATE |
+		XBOXINPUT_QUIRK_IDENTIFY_ACK,
+		{ 0, 0, 2, 0xFF, 0x47, 0xD0 },
+		{ 0x82, 0x02, 0x03, 4, 64 }
+	},
+	{
 		0x20D6, 0x4002, 0x0000, 0xFFFF,
 		"PowerA Spectra Infinity Wired",
 		XBOXINPUT_TRANSPORT_GIP_WIRED,
